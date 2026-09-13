@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.tar.gz
+received/
+qrFrames/
