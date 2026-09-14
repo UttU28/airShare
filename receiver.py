@@ -26,6 +26,9 @@ from sender import (
 )
 
 
+ACK_RETRY_SECONDS = 3.0
+
+
 def missingSeqList(headerGot: bool, chunkMap: Dict[int, bytes], totalFrames: int) -> list[int]:
     missing = []
     if totalFrames <= 0:
@@ -212,7 +215,7 @@ def buildStatusCard(
     )
 
 
-def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -> None:
+def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     outputPath = Path(outputDir).expanduser().resolve()
     outputPath.mkdir(parents=True, exist_ok=True)
 
@@ -229,7 +232,6 @@ def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -
     transferId: Optional[str] = None
     chunkMap: Dict[int, bytes] = {}
     seenPayloads: set[str] = set()
-    windowSized = False
     knownTotal: Optional[int] = None
     lastSeenSeq: Optional[int] = None
     lastReplyRound: Optional[int] = None
@@ -243,7 +245,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -
     camH = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print("\nReceiver ready. Aim camera at sender QR codes.")
     print(f"Camera mode: {camW}x{camH}")
-    print("Start with 3-way align (QR1 here, QR2 on sender, QR3 here).")
+    print("Start with 3-way align (QR1 here, QR2 then last QR3 on sender).")
     print("Press [q] to quit.\n")
 
     aligned = runReceiverAlignment(windowName, stream, detector)
@@ -280,9 +282,9 @@ def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -
 
                     if frameTransferId != transferId:
                         print(f"Ignoring different transferId: {frameTransferId}")
-                    elif kind in ("ackRequest", "statusRequest"):
+                    elif kind == "ackRequest":
                         roundIndex = int(payload.get("round", 0))
-                        canRetry = (time.time() - lastReplyAt) > (statusHold + 2)
+                        canRetry = (time.time() - lastReplyAt) > ACK_RETRY_SECONDS
                         if roundIndex != lastReplyRound or canRetry:
                             pendingStatusRound = roundIndex
                             print(f"ACK QR detected (round {roundIndex}). Showing status.")
@@ -306,14 +308,6 @@ def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -
                                         f"Got data frame seq={seq}  "
                                         f"({len(chunkMap)}/{total - 1} collected)"
                                     )
-                        if payload.get("passEnd"):
-                            roundIndex = int(payload.get("round", 0))
-                            canRetry = (time.time() - lastReplyAt) > (statusHold + 2)
-                            if roundIndex != lastReplyRound or canRetry:
-                                pendingStatusRound = roundIndex
-                                print(f"Last frame of round {roundIndex} detected. Overlaying status QR.")
-                        elif statusCard is not None:
-                            statusCard = None
 
             if pendingStatusRound is not None and transferId and knownTotal:
                 statusCard = buildStatusCard(

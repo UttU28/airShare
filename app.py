@@ -7,13 +7,10 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_QR_DIR = PROJECT_ROOT / "qrFrames"
 DEFAULT_RECEIVE_DIR = PROJECT_ROOT / "received"
 DEFAULT_SHARE_DIR = Path("/Users/antonio/Desktop/amit")
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_FRAME_DELAY = 0.5
-DEFAULT_STATUS_HOLD = 4.0
-DEFAULT_STATUS_SCAN = 20.0
 
 
 def promptChoice(promptText: str, allowed: set[str]) -> str:
@@ -24,51 +21,15 @@ def promptChoice(promptText: str, allowed: set[str]) -> str:
         print(f"Please choose one of: {', '.join(sorted(allowed))}")
 
 
-def promptPath(promptText: str) -> str:
-    while True:
-        value = input(promptText).strip().strip('"').strip("'")
-        if value:
-            return value
-        print("Path cannot be empty.")
-
-
-def promptFloat(promptText: str, defaultValue: float) -> float:
-    raw = input(f"{promptText} [{defaultValue}]: ").strip()
-    if not raw:
-        return defaultValue
-    try:
-        return float(raw)
-    except ValueError:
-        print("Invalid number, using default.")
-        return defaultValue
-
-
-def promptInt(promptText: str, defaultValue: int) -> int:
-    raw = input(f"{promptText} [{defaultValue}]: ").strip()
-    if not raw:
-        return defaultValue
-    try:
-        return int(raw)
-    except ValueError:
-        print("Invalid number, using default.")
-        return defaultValue
-
-
 def runSendMode() -> None:
     from sender import runSender
 
     sourcePath = str(DEFAULT_SHARE_DIR)
-    saveDir = str(DEFAULT_QR_DIR)
     print(f"Sharing directory: {sourcePath}")
-    print(f"QR PNGs will be saved to: {saveDir}")
-
     runSender(
         sourcePath,
         frameDelay=DEFAULT_FRAME_DELAY,
-        saveDir=saveDir,
         cameraIndex=DEFAULT_CAMERA_INDEX,
-        statusHold=DEFAULT_STATUS_HOLD,
-        statusScan=DEFAULT_STATUS_SCAN,
     )
 
 
@@ -78,11 +39,7 @@ def runReceiveMode() -> None:
     outputDir = str(DEFAULT_RECEIVE_DIR)
     print(f"Restoring into: {outputDir}")
     print(f"Camera index: {DEFAULT_CAMERA_INDEX}")
-    runReceiver(
-        outputDir,
-        cameraIndex=DEFAULT_CAMERA_INDEX,
-        statusHold=DEFAULT_STATUS_SCAN,
-    )
+    runReceiver(outputDir, cameraIndex=DEFAULT_CAMERA_INDEX)
 
 
 def printBanner() -> None:

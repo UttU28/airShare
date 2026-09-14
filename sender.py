@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 import cv2
 import numpy as np
@@ -181,15 +180,6 @@ def buildTransferFrames(sourcePath: str) -> tuple[List[str], dict]:
     return frames, summary
 
 
-def saveQrFrames(qrImages: List[np.ndarray], outputDir: str) -> Path:
-    outPath = Path(outputDir).expanduser().resolve()
-    outPath.mkdir(parents=True, exist_ok=True)
-    for index, image in enumerate(qrImages):
-        filePath = outPath / f"frame_{index:05d}.png"
-        cv2.imwrite(str(filePath), image)
-    return outPath
-
-
 def safeDetectAndDecode(detector, frame):
     try:
         rawText, points, _straight = detector.detectAndDecode(frame)
@@ -333,8 +323,8 @@ def makeAlignCard(step: int, handshakeId: str, caption: str) -> np.ndarray:
 
 
 def runSenderAlignment(windowName: str, cameraIndex: int):
-    """Scan receiver QR1 first. Only then generate and show QR2. Wait for QR3."""
-    print("Alignment: camera only until QR 1 is scanned. Then show QR 2.")
+    """QR1 from receiver, then QR2 and last QR3 from sender. Receiver stays aimed at sender."""
+    print("Alignment: camera only until QR 1. Then sender shows QR 2, then last QR 3.")
     capture = openCamera(cameraIndex)
     if capture is None:
         raise RuntimeError("Could not open sender camera for alignment.")
@@ -347,6 +337,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
     qr1Hits = 0
     lastQr1Id = None
     neededHits = 3
+    holdUntil = 0.0
     try:
         while True:
             frame = stream.read()
@@ -380,18 +371,24 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
                             "Sender QR 2 — receiver should scan this",
                         )
                         phase = "show2"
+                        holdUntil = time.time() + 2.8
                 else:
                     qr1Hits = 0
                     lastQr1Id = None
 
-            elif phase == "show2" and rawText:
-                payload = decodeFrame(rawText)
-                if payload and payload.get("kind") == "align":
-                    step = int(payload["step"])
-                    hid = str(payload["handshakeId"])
-                    if hid == handshakeId and step == 3:
-                        print("Got align 3. Handshake complete.")
-                        return handshakeId
+            elif phase == "show2" and time.time() >= holdUntil:
+                print("Showing last handshake QR 3 from sender.")
+                alignCard = makeAlignCard(
+                    3,
+                    handshakeId,
+                    "Sender QR 3 LAST — receiver scans this, then data starts",
+                )
+                phase = "show3"
+                holdUntil = time.time() + 2.8
+
+            elif phase == "show3" and time.time() >= holdUntil:
+                print("Last sender QR shown. Handshake complete. Starting data.")
+                return handshakeId
 
             if phase == "scan1" or alignCard is None:
                 display = cv2.resize(frame, screenSize(), interpolation=cv2.INTER_AREA)
@@ -429,12 +426,11 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
 
 
 def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
-    """Show QR1 while scanning for QR2, then show QR3. Camera never pauses."""
+    """Show QR1 until sender QR2 is read, then camera-only until last sender QR3."""
     handshakeId = makeTransferId()
-    print(f"Alignment: showing QR 1 ({handshakeId}), camera looking for sender QR 2.")
+    print(f"Alignment: showing QR 1 ({handshakeId}). Last QR will come from the sender.")
     card = makeAlignCard(1, handshakeId, "Receiver QR 1 — sender should scan this")
     phase = 1
-    qr3Until = 0.0
     while True:
         frame = stream.read()
         if frame is None:
@@ -449,21 +445,28 @@ def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
             if payload and payload.get("kind") == "align":
                 step = int(payload["step"])
                 hid = str(payload["handshakeId"])
-                if phase == 1 and step == 2 and hid == handshakeId:
-                    print("Got align 2. Showing align 3.")
-                    card = makeAlignCard(
-                        3,
-                        handshakeId,
-                        "Receiver QR 3 — sender final scan",
-                    )
-                    phase = 3
-                    qr3Until = time.time() + 4.0
+                if hid == handshakeId and phase == 1 and step == 2:
+                    print("Got sender QR 2. Camera stays on sender for last QR 3.")
+                    phase = 2
+                    card = None
+                elif hid == handshakeId and phase >= 2 and step == 3:
+                    print("Got last sender QR 3. Alignment complete. Ready for data.")
+                    return handshakeId
 
-        if phase == 3 and time.time() >= qr3Until:
-            print("Alignment complete. Ready for data QRs.")
-            return handshakeId
-
-        display = composeQrOverCamera(frame, card, canvasSize=screenSize())
+        if card is not None:
+            display = composeQrOverCamera(frame, card, canvasSize=screenSize())
+        else:
+            display = cv2.resize(frame, screenSize(), interpolation=cv2.INTER_AREA)
+            cv2.putText(
+                display,
+                "Look at SENDER  —  waiting for last handshake QR 3",
+                (40, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         drawQrOutline(display, points)
         showOnSender(windowName, display)
         key = cv2.waitKey(1) & 0xFF
@@ -471,83 +474,15 @@ def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
             return "quit"
 
 
-def waitWithKeys(duration: float, paused: bool) -> tuple[str, bool]:
-    """Wait up to duration seconds. Returns (action, paused)."""
+def waitForFrame(duration: float) -> str:
+    """Hold a QR on screen. Returns quit if q/esc is pressed."""
     deadline = time.time() + duration
-    while True:
+    while time.time() < deadline:
         remainingMs = max(1, int((deadline - time.time()) * 1000))
         key = cv2.waitKey(min(remainingMs, 50)) & 0xFF
         if key in (ord("q"), 27):
-            return "quit", paused
-        if key == ord("n"):
-            return "next", paused
-        if key == ord("p"):
-            return "prev", paused
-        if key == ord(" "):
-            paused = not paused
-            if paused:
-                deadline = time.time() + 3600
-            else:
-                deadline = time.time() + duration
-        if not paused and time.time() >= deadline:
-            return "next", paused
-
-
-def scanStatusQr(
-    windowName: str,
-    transferId: str,
-    cameraIndex: int,
-    timeoutSeconds: float,
-):
-    capture = openCamera(cameraIndex)
-    if capture is None:
-        print(f"Could not open camera {cameraIndex} for status scan.")
-        print("Allow Camera for Terminal/Cursor in System Settings > Privacy, then retry.")
-        return None
-
-    detector = cv2.QRCodeDetector()
-    deadline = time.time() + timeoutSeconds
-    print(f"Scanning receiver status QR (camera {cameraIndex})...")
-    try:
-        while time.time() < deadline:
-            ok, frame = capture.read()
-            if not ok:
-                continue
-            rawText, points = safeDetectAndDecode(detector, frame)
-            display = frame.copy()
-            drawQrOutline(display, points)
-            left = max(0.0, deadline - time.time())
-            cv2.putText(
-                display,
-                f"Aim at RECEIVER status QR  {left:0.1f}s  id={transferId}",
-                (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(windowName, display)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                return "quit"
-
-            if not rawText:
-                continue
-            payload = decodeFrame(rawText)
-            if payload is None:
-                continue
-            if payload.get("kind") != "status":
-                continue
-            if str(payload.get("transferId")) != transferId:
-                continue
-            print(
-                f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
-            )
-            return payload
-    finally:
-        capture.release()
-    return None
+            return "quit"
+    return "ok"
 
 
 def freezeOnLastUntilStatus(
@@ -555,8 +490,6 @@ def freezeOnLastUntilStatus(
     lastCard: np.ndarray,
     transferId: str,
     cameraIndex: int,
-    statusHold: float,
-    statusScan: float,
 ):
     """Show last QR and scan for status at the same time. Camera thread never sleeps."""
     print("Frozen on last frame. Camera stays live under the QR overlay until status is read.")
@@ -621,10 +554,7 @@ def freezeOnLastUntilStatus(
 def runSender(
     sourcePath: str,
     frameDelay: float | None = None,
-    saveDir: str | None = None,
     cameraIndex: int = 0,
-    statusHold: float = 4.0,
-    statusScan: float = 20.0,
 ) -> None:
     if frameDelay is None:
         from app import DEFAULT_FRAME_DELAY
@@ -648,10 +578,6 @@ def runSender(
     print("Pre-rendering QR images...")
     qrImages = [buildQrImage(payloadText) for payloadText in frames]
 
-    if saveDir:
-        savedPath = saveQrFrames(qrImages, saveDir)
-        print(f"Saved frames to: {savedPath}")
-
     transferId = summary["transferId"]
     totalFrames = len(frames)
     pending = list(range(totalFrames))
@@ -659,40 +585,34 @@ def runSender(
     previousMissing = None
 
     print(f"\nFrame interval: {frameDelay:.2f}s")
-    print("Each pass plays once, then FREEZES on the last QR (no loop).")
-    print("Only missing frames are sent in the next pass.")
-    print("If missing frames stay the same, interval increases by 0.5s and stays up.")
-    print("Controls: [n] next  [p] prev  [space] pause/resume  [q] quit\n")
+    print("Each pass plays once, then freezes on ACK until receiver status.")
+    print("Missing frames are resent. Unchanged missing set adds +0.5s interval.")
+    print("Press [q] to quit.\n")
 
     try:
         while pending:
-            print(f"\n--- Round {roundIndex}: sending {len(pending)} pending frame(s)  interval={frameDelay:.2f}s ---")
-            playIndex = 0
-            paused = False
+            print(
+                f"\n--- Round {roundIndex}: sending {len(pending)} pending "
+                f"frame(s)  interval={frameDelay:.2f}s ---"
+            )
             lastSeq = pending[-1]
-            while playIndex < len(pending):
-                seq = pending[playIndex]
+            for playIndex, seq in enumerate(pending):
                 progressRatio = (playIndex + 1) / len(pending)
                 captionLines = [
                     f"{summary['rootName']}   round {roundIndex}",
                     f"seq {seq}   {playIndex + 1}/{len(pending)} pending   ·   {transferId}",
-                    f"{summary['humanSize']}   ·   {'paused' if paused else 'playing'}",
+                    f"{summary['humanSize']}   ·   playing",
                 ]
                 card = buildPolaroidCard(
                     qrImages[seq],
                     captionLines=captionLines,
                     progressRatio=progressRatio,
-                    paused=paused,
+                    paused=False,
                 )
                 showOnSender(windowName, card)
-                action, paused = waitWithKeys(frameDelay, paused)
-                if action == "quit":
+                if waitForFrame(frameDelay) == "quit":
                     print("Sender stopped.")
                     return
-                if action == "prev":
-                    playIndex = max(0, playIndex - 1)
-                    continue
-                playIndex += 1
 
             ackText = encodeAckRequest(transferId, totalFrames, roundIndex)
             lastCard = buildPolaroidCard(
@@ -713,12 +633,13 @@ def runSender(
                 lastCard,
                 transferId,
                 cameraIndex,
-                statusHold,
-                statusScan,
             )
             if statusPayload == "quit":
                 print("Sender stopped.")
                 return
+            if statusPayload is None:
+                print("No status received. Repeating ACK.")
+                continue
 
             if statusPayload.get("kind") == "done":
                 pending = []

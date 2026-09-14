@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import os
 import tarfile
 from pathlib import Path
 
@@ -49,8 +48,3 @@ def humanSize(numBytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} TB"
-
-
-def estimateFrameCount(archiveBytes: int, chunkSize: int = 320) -> int:
-    dataFrames = (archiveBytes + chunkSize - 1) // chunkSize if archiveBytes else 0
-    return dataFrames + 1
