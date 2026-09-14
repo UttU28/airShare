@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from packer import humanSize, unpackArchive
-from protocol import decodeFrame, encodeStatus, rebuildArchive, validateDataFrame
+from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame
 from sender import (
     CameraStream,
     buildPolaroidCard,
@@ -20,6 +20,7 @@ from sender import (
     openCamera,
     runReceiverAlignment,
     safeDetectAndDecode,
+    screenSize,
     setupFullscreen,
     showOnSender,
 )
@@ -154,6 +155,38 @@ def tryUnpack(headerMeta, chunkMap, outputPath: Path) -> bool:
     dest = unpackArchive(archiveBytes, str(outputPath))
     print(f"Done. Restored under: {dest / headerMeta['rootName']}")
     return True
+
+
+def buildDoneCard(transferId: str, knownTotal: int) -> np.ndarray:
+    doneText = encodeDone(transferId, knownTotal)
+    return buildPolaroidCard(
+        buildQrImage(doneText),
+        captionLines=[
+            "TRANSFER COMPLETE",
+            f"all {knownTotal} frames received   ·   {transferId}",
+            "Sender: scan this QR, then both apps quit",
+        ],
+        progressRatio=1.0,
+        paused=False,
+    )
+
+
+def showDoneAcknowledgment(windowName: str, stream, transferId: str, knownTotal: int) -> None:
+    doneCard = buildDoneCard(transferId, knownTotal)
+    print("Showing DONE QR for sender. Camera PiP bottom-right.")
+    holdUntil = time.time() + 8.0
+    while time.time() < holdUntil:
+        frame = stream.read()
+        if frame is None:
+            key = cv2.waitKey(30) & 0xFF
+            if key in (ord("q"), 27):
+                return
+            continue
+        display = composeQrOverCamera(frame, doneCard, canvasSize=screenSize())
+        showOnSender(windowName, display)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            return
 
 
 def buildStatusCard(
@@ -304,13 +337,19 @@ def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -
                 lastSeenSeq=lastSeenSeq,
             )
             if statusCard is not None:
-                preview = composeQrOverCamera(preview, statusCard)
+                preview = composeQrOverCamera(frame, statusCard, canvasSize=screenSize())
             showOnSender(windowName, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
 
             if tryUnpack(headerMeta, chunkMap, outputPath):
+                showDoneAcknowledgment(
+                    windowName,
+                    stream,
+                    str(transferId),
+                    int(headerMeta["total"]),
+                )
                 break
     finally:
         stream.stop()

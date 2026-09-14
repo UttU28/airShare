@@ -94,7 +94,7 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
     if payload.get("magic") != MAGIC:
         return None
     kind = payload.get("kind")
-    if kind not in ("header", "data", "statusRequest", "status", "align", "ackRequest"):
+    if kind not in ("header", "data", "statusRequest", "status", "align", "ackRequest", "done"):
         return None
     if kind == "align":
         if "step" not in payload or "handshakeId" not in payload:
@@ -104,7 +104,7 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
         return None
     if kind in ("header", "data") and ("seq" not in payload or "total" not in payload):
         return None
-    if kind in ("statusRequest", "status", "ackRequest") and "total" not in payload:
+    if kind in ("statusRequest", "status", "ackRequest", "done") and "total" not in payload:
         return None
     return payload
 
@@ -116,6 +116,17 @@ def encodeAckRequest(transferId: str, total: int, roundIndex: int) -> str:
         "transferId": transferId,
         "total": total,
         "round": roundIndex,
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def encodeDone(transferId: str, total: int) -> str:
+    payload = {
+        "magic": MAGIC,
+        "kind": "done",
+        "transferId": transferId,
+        "total": total,
+        "gotCount": total,
     }
     return json.dumps(payload, separators=(",", ":"))
 

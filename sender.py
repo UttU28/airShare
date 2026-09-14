@@ -279,21 +279,42 @@ def composeQrOverCamera(
     qrCard: np.ndarray,
     canvasSize: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    """One view: live camera behind a large QR. canvasSize defaults to the camera frame."""
+    """Large QR in the center, live camera picture-in-picture at bottom right."""
     if canvasSize is None:
         screenH, screenW = cameraFrame.shape[:2]
     else:
         screenW, screenH = canvasSize
-    display = cv2.resize(cameraFrame, (screenW, screenH), interpolation=cv2.INTER_AREA)
-    display = (display.astype(np.float32) * 0.28).astype(np.uint8)
+    display = np.full((screenH, screenW, 3), (28, 26, 24), dtype=np.uint8)
 
     qrScale = min((screenH * 0.88) / float(qrCard.shape[0]), (screenW * 0.72) / float(qrCard.shape[1]))
     qrW = max(1, int(qrCard.shape[1] * qrScale))
     qrH = max(1, int(qrCard.shape[0] * qrScale))
     qrResized = cv2.resize(qrCard, (qrW, qrH), interpolation=cv2.INTER_NEAREST)
     x0 = (screenW - qrW) // 2
-    y0 = (screenH - qrH) // 2
+    y0 = max(8, (screenH - qrH) // 2 - int(screenH * 0.04))
+    y0 = min(y0, screenH - qrH)
     display[y0 : y0 + qrH, x0 : x0 + qrW] = qrResized
+
+    camH, camW = cameraFrame.shape[:2]
+    pipW = max(160, min(int(screenW * 0.24), 420))
+    pipH = max(90, int(pipW * camH / float(camW))) if camW else int(pipW * 9 / 16)
+    pipH = min(pipH, int(screenH * 0.28))
+    pip = cv2.resize(cameraFrame, (pipW, pipH), interpolation=cv2.INTER_AREA)
+    margin = 18
+    px = screenW - pipW - margin
+    py = screenH - pipH - margin
+    display[py : py + pipH, px : px + pipW] = pip
+    cv2.rectangle(display, (px - 2, py - 2), (px + pipW + 1, py + pipH + 1), (0, 255, 255), 2)
+    cv2.putText(
+        display,
+        "camera",
+        (px + 8, py + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
     return display
 
 
@@ -581,13 +602,16 @@ def freezeOnLastUntilStatus(
             payload = decodeFrame(rawText)
             if payload is None:
                 continue
-            if payload.get("kind") != "status":
+            if payload.get("kind") not in ("status", "done"):
                 continue
             if str(payload.get("transferId")) != transferId:
                 continue
-            print(
-                f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
-            )
+            if payload.get("kind") == "done":
+                print("Receiver reports transfer complete.")
+            else:
+                print(
+                    f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
+                )
             return payload
     finally:
         stream.stop()
@@ -696,7 +720,10 @@ def runSender(
                 print("Sender stopped.")
                 return
 
-            pending = missingSeqsFromStatus(statusPayload)
+            if statusPayload.get("kind") == "done":
+                pending = []
+            else:
+                pending = missingSeqsFromStatus(statusPayload)
             print(f"Receiver still missing {len(pending)} frame(s).")
             if previousMissing is not None and pending == previousMissing:
                 frameDelay += 0.5
@@ -712,13 +739,14 @@ def runSender(
                     captionLines=[
                         "TRANSFER COMPLETE",
                         f"{transferId}",
-                        "Receiver should unpack now.",
+                        "All files received. Quitting.",
                     ],
                     progressRatio=1.0,
                     paused=False,
                 )
                 showOnSender(windowName, doneCard)
-                cv2.waitKey(800)
+                cv2.waitKey(1500)
+                print("Sender stopped.")
                 return
 
             print("Starting next pass automatically.")
