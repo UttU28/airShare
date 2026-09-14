@@ -2,25 +2,28 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
-from typing import List, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
 import qrcode
 from qrcode.constants import ERROR_CORRECT_M
 
-from packer import humanSize, packDirectory
+from packer import humanSize, listShareEntries
 from protocol import (
     decodeFrame,
     encodeAckRequest,
     encodeAlign,
     encodeDataFrame,
     encodeHeaderFrame,
+    encodeSessionDone,
     makeTransferId,
     missingSeqsFromStatus,
-    packDirectoryArchive,
+    packBytePayload,
 )
 
 
@@ -79,6 +82,44 @@ def buildQrImage(payloadText: str, boxSize: int = 8, border: int = 4) -> np.ndar
     qr.make(fit=True)
     pilImage = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     return cv2.cvtColor(np.array(pilImage), cv2.COLOR_RGB2BGR)
+
+
+class QrPrefetcher:
+    """Generate QR images just in time, keeping only a small lookahead in RAM."""
+
+    def __init__(self, payloads: Sequence[str], workerCount: int | None = None, ahead: int = 24):
+        self.payloads = payloads
+        self.ahead = max(4, ahead)
+        self.workerCount = max(1, workerCount or (os.cpu_count() or 4))
+        self.executor = ThreadPoolExecutor(max_workers=self.workerCount)
+        self.jobs: Dict[int, object] = {}
+
+    def warm(self, seqs: Sequence[int]) -> None:
+        for seq in seqs:
+            if seq < 0 or seq >= len(self.payloads):
+                continue
+            if seq not in self.jobs:
+                self.jobs[seq] = self.executor.submit(buildQrImage, self.payloads[seq])
+
+    def get(self, seq: int) -> np.ndarray:
+        self.warm([seq])
+        image = self.jobs[seq].result()
+        return image
+
+    def drop(self, seq: int) -> None:
+        self.jobs.pop(seq, None)
+
+    def prefetchAround(self, seqs: Sequence[int], startIndex: int) -> None:
+        window = seqs[startIndex : startIndex + self.ahead]
+        self.warm(window)
+        keep = set(window)
+        for seq in list(self.jobs):
+            if seq not in keep:
+                self.drop(seq)
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=False)
+        self.jobs.clear()
 
 
 def buildPolaroidCard(
@@ -160,24 +201,137 @@ def buildPolaroidCard(
     return card
 
 
-def buildTransferFrames(sourcePath: str) -> tuple[List[str], dict]:
-    archiveBytes, rootName = packDirectory(sourcePath)
+def buildEntryFrames(
+    entry: dict,
+    sessionId: str,
+    rootName: str,
+    fileIndex: int,
+    fileCount: int,
+) -> tuple[List[str], dict]:
     transferId = makeTransferId()
-    headerMeta, dataChunks = packDirectoryArchive(archiveBytes, transferId, rootName)
+    if entry["kind"] == "dir":
+        payloadBytes = b""
+    else:
+        payloadBytes = entry["absPath"].read_bytes()
 
+    headerMeta, dataChunks = packBytePayload(
+        payloadBytes,
+        transferId,
+        extraMeta={
+            "sessionId": sessionId,
+            "rootName": rootName,
+            "relPath": entry["relPath"],
+            "entryKind": entry["kind"],
+            "fileIndex": fileIndex,
+            "fileCount": fileCount,
+        },
+    )
     frames: List[str] = [encodeHeaderFrame(headerMeta)]
     total = int(headerMeta["total"])
     for index, chunkBytes in enumerate(dataChunks, start=1):
         frames.append(encodeDataFrame(transferId, index, total, chunkBytes))
 
     summary = {
+        "sessionId": sessionId,
         "transferId": transferId,
         "rootName": rootName,
-        "byteSize": len(archiveBytes),
+        "relPath": entry["relPath"],
+        "entryKind": entry["kind"],
+        "fileIndex": fileIndex,
+        "fileCount": fileCount,
+        "byteSize": len(payloadBytes),
         "totalFrames": total,
-        "humanSize": humanSize(len(archiveBytes)),
+        "humanSize": humanSize(len(payloadBytes)),
     }
     return frames, summary
+
+
+def sendUntilComplete(
+    windowName: str,
+    frames: List[str],
+    summary: dict,
+    frameDelay: float,
+    cameraIndex: int,
+) -> str:
+    """Play one file's frames until receiver done or quit. Returns complete|quit."""
+    qrPrefetch = QrPrefetcher(frames, ahead=24)
+    transferId = summary["transferId"]
+    totalFrames = len(frames)
+    pending = list(range(totalFrames))
+    roundIndex = 1
+    previousMissing = None
+    fileLabel = f"{summary['fileIndex']}/{summary['fileCount']}  {summary['relPath']}"
+    try:
+        while pending:
+            print(
+                f"\n--- {fileLabel}  round {roundIndex}: "
+                f"{len(pending)} pending  interval={frameDelay:.2f}s ---"
+            )
+            lastSeq = pending[-1]
+            for playIndex, seq in enumerate(pending):
+                qrPrefetch.prefetchAround(pending, playIndex)
+                progressRatio = (playIndex + 1) / len(pending)
+                captionLines = [
+                    f"{summary['rootName']}  {fileLabel}",
+                    f"seq {seq}  {playIndex + 1}/{len(pending)}  ·  {transferId}",
+                    f"{summary['humanSize']}  ·  playing",
+                ]
+                card = buildPolaroidCard(
+                    qrPrefetch.get(seq),
+                    captionLines=captionLines,
+                    progressRatio=progressRatio,
+                    paused=False,
+                )
+                qrPrefetch.drop(seq)
+                showOnSender(windowName, card)
+                if waitForFrame(frameDelay) == "quit":
+                    return "quit"
+
+            ackText = encodeAckRequest(transferId, totalFrames, roundIndex)
+            lastCard = buildPolaroidCard(
+                buildQrImage(ackText),
+                captionLines=[
+                    f"ACK REQUEST  {fileLabel}  round {roundIndex}",
+                    f"last data seq {lastSeq}  ·  {transferId}",
+                    "Receiver: send status now",
+                ],
+                progressRatio=1.0,
+                paused=False,
+            )
+            showOnSender(windowName, lastCard)
+            cv2.waitKey(1)
+
+            statusPayload = freezeOnLastUntilStatus(
+                windowName,
+                lastCard,
+                transferId,
+                cameraIndex,
+            )
+            if statusPayload == "quit":
+                return "quit"
+            if statusPayload is None:
+                print("No status received. Repeating ACK.")
+                continue
+
+            if statusPayload.get("kind") == "done":
+                pending = []
+            else:
+                pending = missingSeqsFromStatus(statusPayload)
+            print(f"Receiver still missing {len(pending)} frame(s) for this file.")
+            if previousMissing is not None and pending == previousMissing:
+                frameDelay += 0.5
+                print(
+                    f"Missing set unchanged. Interval +0.5s → {frameDelay:.2f}s "
+                    "(kept for later rounds of this file)."
+                )
+            previousMissing = list(pending)
+            if not pending:
+                print(f"File complete: {summary['relPath']}")
+                return "complete"
+            roundIndex += 1
+        return "complete"
+    finally:
+        qrPrefetch.close()
 
 
 def safeDetectAndDecode(detector, frame):
@@ -540,7 +694,7 @@ def freezeOnLastUntilStatus(
             if str(payload.get("transferId")) != transferId:
                 continue
             if payload.get("kind") == "done":
-                print("Receiver reports transfer complete.")
+                print("Receiver reports this file is complete.")
             else:
                 print(
                     f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
@@ -560,118 +714,57 @@ def runSender(
         from app import DEFAULT_FRAME_DELAY
 
         frameDelay = DEFAULT_FRAME_DELAY
+
+    print("\nListing files (one file per transfer, written as it completes)...")
+    rootName, _rootPath, entries = listShareEntries(sourcePath)
+    sessionId = makeTransferId()
+    fileCount = len(entries)
+    totalBytes = sum(int(entry["byteSize"]) for entry in entries)
+    print(f"Session ID  : {sessionId}")
+    print(f"Root name   : {rootName}")
+    print(f"Files/dirs  : {fileCount}")
+    print(f"Total data  : {humanSize(totalBytes)}")
+    print("Each file is ACK'd and saved before the next one starts.")
+
     windowName = "codeShare Sender"
-    setupFullscreen(windowName)
-    aligned = runSenderAlignment(windowName, cameraIndex)
-    if aligned == "quit":
-        cv2.destroyAllWindows()
-        print("Sender stopped.")
-        return
-
-    print("\nPacking directory...")
-    frames, summary = buildTransferFrames(sourcePath)
-    print(f"Transfer ID : {summary['transferId']}")
-    print(f"Root name   : {summary['rootName']}")
-    print(f"Archive size: {summary['humanSize']}")
-    print(f"QR frames   : {summary['totalFrames']}")
-
-    print("Pre-rendering QR images...")
-    qrImages = [buildQrImage(payloadText) for payloadText in frames]
-
-    transferId = summary["transferId"]
-    totalFrames = len(frames)
-    pending = list(range(totalFrames))
-    roundIndex = 1
-    previousMissing = None
-
-    print(f"\nFrame interval: {frameDelay:.2f}s")
-    print("Each pass plays once, then freezes on ACK until receiver status.")
-    print("Missing frames are resent. Unchanged missing set adds +0.5s interval.")
-    print("Press [q] to quit.\n")
-
     try:
-        while pending:
+        setupFullscreen(windowName)
+        aligned = runSenderAlignment(windowName, cameraIndex)
+        if aligned == "quit":
+            print("Sender stopped.")
+            return
+
+        print(f"\nFrame interval: {frameDelay:.2f}s")
+        print("Press [q] to quit.\n")
+
+        for fileIndex, entry in enumerate(entries, start=1):
             print(
-                f"\n--- Round {roundIndex}: sending {len(pending)} pending "
-                f"frame(s)  interval={frameDelay:.2f}s ---"
+                f"\n===== File {fileIndex}/{fileCount}: {entry['relPath']} "
+                f"({humanSize(entry['byteSize'])}) ====="
             )
-            lastSeq = pending[-1]
-            for playIndex, seq in enumerate(pending):
-                progressRatio = (playIndex + 1) / len(pending)
-                captionLines = [
-                    f"{summary['rootName']}   round {roundIndex}",
-                    f"seq {seq}   {playIndex + 1}/{len(pending)} pending   ·   {transferId}",
-                    f"{summary['humanSize']}   ·   playing",
-                ]
-                card = buildPolaroidCard(
-                    qrImages[seq],
-                    captionLines=captionLines,
-                    progressRatio=progressRatio,
-                    paused=False,
-                )
-                showOnSender(windowName, card)
-                if waitForFrame(frameDelay) == "quit":
-                    print("Sender stopped.")
-                    return
-
-            ackText = encodeAckRequest(transferId, totalFrames, roundIndex)
-            lastCard = buildPolaroidCard(
-                buildQrImage(ackText),
-                captionLines=[
-                    f"ACK REQUEST   round {roundIndex}",
-                    f"pass done  last data seq {lastSeq}   ·   {transferId}",
-                    "Receiver: this QR always means send status now",
-                ],
-                progressRatio=1.0,
-                paused=False,
+            frames, summary = buildEntryFrames(
+                entry, sessionId, rootName, fileIndex, fileCount
             )
-            showOnSender(windowName, lastCard)
-            cv2.waitKey(1)
-
-            statusPayload = freezeOnLastUntilStatus(
-                windowName,
-                lastCard,
-                transferId,
-                cameraIndex,
+            result = sendUntilComplete(
+                windowName, frames, summary, frameDelay, cameraIndex
             )
-            if statusPayload == "quit":
-                print("Sender stopped.")
-                return
-            if statusPayload is None:
-                print("No status received. Repeating ACK.")
-                continue
-
-            if statusPayload.get("kind") == "done":
-                pending = []
-            else:
-                pending = missingSeqsFromStatus(statusPayload)
-            print(f"Receiver still missing {len(pending)} frame(s).")
-            if previousMissing is not None and pending == previousMissing:
-                frameDelay += 0.5
-                print(
-                    f"Missing set unchanged. Interval +0.5s → {frameDelay:.2f}s "
-                    "(kept for later rounds)."
-                )
-            previousMissing = list(pending)
-            if not pending:
-                print("Receiver has everything. Transfer complete.")
-                doneCard = buildPolaroidCard(
-                    qrImages[0],
-                    captionLines=[
-                        "TRANSFER COMPLETE",
-                        f"{transferId}",
-                        "All files received. Quitting.",
-                    ],
-                    progressRatio=1.0,
-                    paused=False,
-                )
-                showOnSender(windowName, doneCard)
-                cv2.waitKey(1500)
+            if result == "quit":
                 print("Sender stopped.")
                 return
 
-            print("Starting next pass automatically.")
-            roundIndex += 1
+        sessionText = encodeSessionDone(sessionId, fileCount)
+        doneCard = buildPolaroidCard(
+            buildQrImage(sessionText),
+            captionLines=[
+                "SESSION COMPLETE",
+                f"{fileCount} files  ·  {sessionId}",
+                "All files received. Quitting.",
+            ],
+            progressRatio=1.0,
+            paused=False,
+        )
+        showOnSender(windowName, doneCard)
+        cv2.waitKey(2000)
+        print("All files sent. Sender stopped.")
     finally:
         cv2.destroyAllWindows()
-    print("Sender stopped.")

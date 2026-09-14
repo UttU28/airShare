@@ -9,7 +9,7 @@ import time
 import cv2
 import numpy as np
 
-from packer import humanSize, unpackArchive
+from packer import humanSize, writeReceivedDir, writeReceivedFile
 from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame
 from sender import (
     CameraStream,
@@ -147,27 +147,41 @@ def scaleFrameToFit(frame: np.ndarray, maxWidth: int = 1400, maxHeight: int = 90
     return cv2.resize(frame, (newWidth, newHeight), interpolation=interpolation)
 
 
-def tryUnpack(headerMeta, chunkMap, outputPath: Path) -> bool:
+def trySaveFile(headerMeta, chunkMap, outputPath: Path) -> bool:
     if headerMeta is None:
         return False
     total = int(headerMeta["total"])
     if len(chunkMap) != total - 1:
         return False
-    print("\nAll frames received. Rebuilding archive...")
-    archiveBytes = rebuildArchive(headerMeta, chunkMap)
-    dest = unpackArchive(archiveBytes, str(outputPath))
-    print(f"Done. Restored under: {dest / headerMeta['rootName']}")
+    relPath = str(headerMeta.get("relPath") or headerMeta.get("rootName") or "file")
+    rootName = str(headerMeta.get("rootName") or "share")
+    entryKind = str(headerMeta.get("entryKind") or "file")
+    fileIndex = headerMeta.get("fileIndex")
+    fileCount = headerMeta.get("fileCount")
+    progress = ""
+    if fileIndex and fileCount:
+        progress = f" [{fileIndex}/{fileCount}]"
+
+    if entryKind == "dir":
+        dest = writeReceivedDir(str(outputPath), rootName, relPath)
+        print(f"Saved empty dir{progress}: {dest}")
+        return True
+
+    print(f"\nFile complete{progress}. Writing {relPath}...")
+    payloadBytes = rebuildArchive(headerMeta, chunkMap)
+    dest = writeReceivedFile(str(outputPath), rootName, relPath, payloadBytes)
+    print(f"Wrote {humanSize(len(payloadBytes))} → {dest}")
     return True
 
 
-def buildDoneCard(transferId: str, knownTotal: int) -> np.ndarray:
+def buildDoneCard(transferId: str, knownTotal: int, relPath: str = "") -> np.ndarray:
     doneText = encodeDone(transferId, knownTotal)
     return buildPolaroidCard(
         buildQrImage(doneText),
         captionLines=[
-            "TRANSFER COMPLETE",
-            f"all {knownTotal} frames received   ·   {transferId}",
-            "Sender: scan this QR, then both apps quit",
+            "FILE COMPLETE",
+            f"{relPath}" if relPath else f"all {knownTotal} frames received",
+            f"{knownTotal} frames  ·  {transferId}  — sender scan this, then next file",
         ],
         progressRatio=1.0,
         paused=False,
@@ -176,7 +190,7 @@ def buildDoneCard(transferId: str, knownTotal: int) -> np.ndarray:
 
 def showDoneAcknowledgment(windowName: str, stream, transferId: str, knownTotal: int) -> None:
     doneCard = buildDoneCard(transferId, knownTotal)
-    print("Showing DONE QR for sender. Camera PiP bottom-right.")
+    print("Showing FILE COMPLETE QR for sender. Camera PiP bottom-right.")
     holdUntil = time.time() + 8.0
     while time.time() < holdUntil:
         frame = stream.read()
@@ -237,6 +251,9 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     lastReplyRound: Optional[int] = None
     lastReplyAt = 0.0
     statusCard = None
+    fileSaved = False
+    doneCard = None
+    filesSaved = 0
 
     windowName = "codeShare Receiver"
     setupFullscreen(windowName)
@@ -246,6 +263,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     print("\nReceiver ready. Aim camera at sender QR codes.")
     print(f"Camera mode: {camW}x{camH}")
     print("Start with 3-way align (QR1 here, QR2 then last QR3 on sender).")
+    print("Files are saved one at a time as each completes.")
     print("Press [q] to quit.\n")
 
     aligned = runReceiverAlignment(windowName, stream, detector)
@@ -273,22 +291,43 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                     kind = payload["kind"]
                     if kind == "align":
                         continue
+                    if kind == "sessionDone":
+                        print(
+                            f"Session complete. Saved {filesSaved} file(s). Receiver quitting."
+                        )
+                        break
+
                     total = int(payload["total"])
                     frameTransferId = str(payload["transferId"])
+
+                    if kind == "header" and (
+                        transferId is None or (fileSaved and frameTransferId != transferId)
+                    ):
+                        transferId = frameTransferId
+                        headerMeta = None
+                        chunkMap = {}
+                        seenPayloads = set()
+                        lastSeenSeq = None
+                        lastReplyRound = None
+                        statusCard = None
+                        doneCard = None
+                        fileSaved = False
+                        print(f"\nStarting file transfer {frameTransferId}")
+
                     knownTotal = total
 
                     if transferId is None:
                         transferId = frameTransferId
 
                     if frameTransferId != transferId:
-                        print(f"Ignoring different transferId: {frameTransferId}")
+                        print(f"Ignoring other file transferId: {frameTransferId}")
                     elif kind == "ackRequest":
                         roundIndex = int(payload.get("round", 0))
                         canRetry = (time.time() - lastReplyAt) > ACK_RETRY_SECONDS
                         if roundIndex != lastReplyRound or canRetry:
                             pendingStatusRound = roundIndex
                             print(f"ACK QR detected (round {roundIndex}). Showing status.")
-                    elif kind in ("header", "data"):
+                    elif kind in ("header", "data") and not fileSaved:
                         seq = int(payload["seq"])
                         lastSeenSeq = seq
                         if rawText not in seenPayloads:
@@ -296,7 +335,8 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                             if kind == "header" and headerMeta is None:
                                 headerMeta = payload
                                 print(
-                                    f"Header: root={payload.get('rootName')} "
+                                    f"Header: {payload.get('relPath')} "
+                                    f"{payload.get('fileIndex')}/{payload.get('fileCount')} "
                                     f"size={humanSize(int(payload['byteSize']))} "
                                     f"frames={total}"
                                 )
@@ -330,21 +370,22 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 totalFrames=knownTotal,
                 lastSeenSeq=lastSeenSeq,
             )
-            if statusCard is not None:
+            if statusCard is not None and not fileSaved:
                 preview = composeQrOverCamera(frame, statusCard, canvasSize=screenSize())
+            elif fileSaved and doneCard is not None:
+                preview = composeQrOverCamera(frame, doneCard, canvasSize=screenSize())
             showOnSender(windowName, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
 
-            if tryUnpack(headerMeta, chunkMap, outputPath):
-                showDoneAcknowledgment(
-                    windowName,
-                    stream,
-                    str(transferId),
-                    int(headerMeta["total"]),
-                )
-                break
+            if not fileSaved and trySaveFile(headerMeta, chunkMap, outputPath):
+                fileSaved = True
+                filesSaved += 1
+                relPath = str(headerMeta.get("relPath") or "")
+                doneCard = buildDoneCard(str(transferId), int(headerMeta["total"]), relPath)
+                statusCard = None
+                print("Showing FILE COMPLETE QR. Waiting for next file or session done.")
     finally:
         stream.stop()
         capture.release()

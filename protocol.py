@@ -26,27 +26,32 @@ def shortChecksum(data: bytes) -> str:
     return sha256Hex(data)[:12]
 
 
-def packDirectoryArchive(archiveBytes: bytes, transferId: str, rootName: str) -> Tuple[Dict[str, Any], List[bytes]]:
-    """Split archive into header meta + data chunks."""
-    archiveHash = sha256Hex(archiveBytes)
+def packBytePayload(
+    payloadBytes: bytes,
+    transferId: str,
+    extraMeta: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[bytes]]:
+    """Split one file (or empty dir marker) into header + data chunks."""
+    contentHash = sha256Hex(payloadBytes)
     dataChunks: List[bytes] = []
     offset = 0
-    while offset < len(archiveBytes):
-        dataChunks.append(archiveBytes[offset : offset + DEFAULT_CHUNK_SIZE])
+    while offset < len(payloadBytes):
+        dataChunks.append(payloadBytes[offset : offset + DEFAULT_CHUNK_SIZE])
         offset += DEFAULT_CHUNK_SIZE
 
-    totalFrames = len(dataChunks) + 1  # +1 header frame
+    totalFrames = len(dataChunks) + 1
     headerMeta: Dict[str, Any] = {
         "magic": MAGIC,
         "kind": "header",
         "transferId": transferId,
         "seq": HEADER_SEQ,
         "total": totalFrames,
-        "rootName": rootName,
-        "byteSize": len(archiveBytes),
-        "archiveHash": archiveHash,
+        "byteSize": len(payloadBytes),
+        "archiveHash": contentHash,
         "chunkSize": DEFAULT_CHUNK_SIZE,
     }
+    if extraMeta:
+        headerMeta.update(extraMeta)
     return headerMeta, dataChunks
 
 
@@ -94,7 +99,7 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
     if payload.get("magic") != MAGIC:
         return None
     kind = payload.get("kind")
-    if kind not in ("header", "data", "status", "align", "ackRequest", "done"):
+    if kind not in ("header", "data", "status", "align", "ackRequest", "done", "sessionDone"):
         return None
     if kind == "align":
         if "step" not in payload or "handshakeId" not in payload:
@@ -106,6 +111,8 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
         return None
     if kind in ("status", "ackRequest", "done") and "total" not in payload:
         return None
+    if kind == "sessionDone" and "sessionId" not in payload:
+        return None
     return payload
 
 
@@ -116,6 +123,18 @@ def encodeAckRequest(transferId: str, total: int, roundIndex: int) -> str:
         "transferId": transferId,
         "total": total,
         "round": roundIndex,
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def encodeSessionDone(sessionId: str, fileCount: int) -> str:
+    payload = {
+        "magic": MAGIC,
+        "kind": "sessionDone",
+        "sessionId": sessionId,
+        "transferId": sessionId,
+        "total": fileCount,
+        "fileCount": fileCount,
     }
     return json.dumps(payload, separators=(",", ":"))
 
