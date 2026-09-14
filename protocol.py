@@ -9,7 +9,8 @@ import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
 MAGIC = "CS01"
-DEFAULT_CHUNK_SIZE = 1200
+# Small payloads keep QR version low so modules stay large on screen (easier under glare).
+DEFAULT_CHUNK_SIZE = 200
 HEADER_SEQ = 0
 
 
@@ -49,6 +50,17 @@ def packDirectoryArchive(archiveBytes: bytes, transferId: str, rootName: str) ->
     return headerMeta, dataChunks
 
 
+def encodeAlign(step: int, handshakeId: str, **extra) -> str:
+    payload = {
+        "magic": MAGIC,
+        "kind": "align",
+        "step": int(step),
+        "handshakeId": handshakeId,
+    }
+    payload.update(extra)
+    return json.dumps(payload, separators=(",", ":"))
+
+
 def encodeHeaderFrame(headerMeta: Dict[str, Any]) -> str:
     return json.dumps(headerMeta, separators=(",", ":"))
 
@@ -81,11 +93,89 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
         return None
     if payload.get("magic") != MAGIC:
         return None
-    if payload.get("kind") not in ("header", "data"):
+    kind = payload.get("kind")
+    if kind not in ("header", "data", "statusRequest", "status", "align", "ackRequest"):
         return None
-    if "transferId" not in payload or "seq" not in payload or "total" not in payload:
+    if kind == "align":
+        if "step" not in payload or "handshakeId" not in payload:
+            return None
+        return payload
+    if "transferId" not in payload:
+        return None
+    if kind in ("header", "data") and ("seq" not in payload or "total" not in payload):
+        return None
+    if kind in ("statusRequest", "status", "ackRequest") and "total" not in payload:
         return None
     return payload
+
+
+def encodeAckRequest(transferId: str, total: int, roundIndex: int) -> str:
+    payload = {
+        "magic": MAGIC,
+        "kind": "ackRequest",
+        "transferId": transferId,
+        "total": total,
+        "round": roundIndex,
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def markPassEnd(payloadText: str, roundIndex: int) -> str:
+    payload = json.loads(payloadText)
+    payload["passEnd"] = True
+    payload["round"] = roundIndex
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def encodeStatus(
+    transferId: str,
+    total: int,
+    headerGot: bool,
+    gotDataSeqs: List[int],
+    roundIndex: int,
+) -> str:
+    mask = bytearray((total + 7) // 8)
+    if headerGot and total > 0:
+        mask[0] |= 1
+    for seq in gotDataSeqs:
+        if 1 <= seq < total:
+            mask[seq // 8] |= 1 << (seq % 8)
+    gotCount = (1 if headerGot else 0) + len(gotDataSeqs)
+    payload = {
+        "magic": MAGIC,
+        "kind": "status",
+        "transferId": transferId,
+        "total": total,
+        "round": roundIndex,
+        "gotCount": gotCount,
+        "mask": base64.b64encode(bytes(mask)).decode("ascii"),
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def gotSeqsFromStatus(payload: Dict[str, Any]) -> set[int]:
+    total = int(payload["total"])
+    encoded = payload.get("mask")
+    if not isinstance(encoded, str):
+        return set()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return set()
+    got: set[int] = set()
+    for seq in range(total):
+        byteIndex = seq // 8
+        if byteIndex >= len(raw):
+            break
+        if raw[byteIndex] & (1 << (seq % 8)):
+            got.add(seq)
+    return got
+
+
+def missingSeqsFromStatus(payload: Dict[str, Any]) -> List[int]:
+    total = int(payload["total"])
+    got = gotSeqsFromStatus(payload)
+    return [seq for seq in range(total) if seq not in got]
 
 
 def validateDataFrame(payload: Dict[str, Any]) -> Optional[bytes]:

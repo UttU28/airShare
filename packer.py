@@ -51,6 +51,6 @@ def humanSize(numBytes: int) -> str:
     return f"{size:.1f} TB"
 
 
-def estimateFrameCount(archiveBytes: int, chunkSize: int = 1200) -> int:
+def estimateFrameCount(archiveBytes: int, chunkSize: int = 320) -> int:
     dataFrames = (archiveBytes + chunkSize - 1) // chunkSize if archiveBytes else 0
     return dataFrames + 1

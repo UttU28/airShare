@@ -4,113 +4,315 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Optional
+import time
 
 import cv2
+import numpy as np
 
 from packer import humanSize, unpackArchive
-from protocol import decodeFrame, rebuildArchive, validateDataFrame
+from protocol import decodeFrame, encodeStatus, rebuildArchive, validateDataFrame
+from sender import (
+    CameraStream,
+    buildPolaroidCard,
+    buildQrImage,
+    composeQrOverCamera,
+    drawQrOutline,
+    openCamera,
+    runReceiverAlignment,
+    safeDetectAndDecode,
+    setupFullscreen,
+    showOnSender,
+)
 
 
-def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
+def missingSeqList(headerGot: bool, chunkMap: Dict[int, bytes], totalFrames: int) -> list[int]:
+    missing = []
+    if totalFrames <= 0:
+        return missing
+    if not headerGot:
+        missing.append(0)
+    for seq in range(1, totalFrames):
+        if seq not in chunkMap:
+            missing.append(seq)
+    return missing
+
+
+def drawChunkOverlay(
+    image: np.ndarray,
+    headerGot: bool,
+    chunkMap: Dict[int, bytes],
+    totalFrames: Optional[int],
+    lastSeenSeq: Optional[int],
+) -> np.ndarray:
+    """Bottom seek bar: each chunk as got / missing, plus a count caption."""
+    height, width = image.shape[:2]
+    panelHeight = 92
+    panelTop = max(0, height - panelHeight)
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, panelTop), (width, height), (18, 16, 14), -1)
+    display = cv2.addWeighted(overlay, 0.78, image, 0.22, 0)
+
+    margin = 18
+    if not totalFrames:
+        caption = "waiting for first QR..."
+        cv2.putText(
+            display,
+            caption,
+            (margin, panelTop + 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (220, 220, 220),
+            2,
+            cv2.LINE_AA,
+        )
+        return display
+
+    dataExpected = max(0, totalFrames - 1)
+    dataGot = len(chunkMap)
+    missing = missingSeqList(headerGot, chunkMap, totalFrames)
+    missingPreview = ", ".join(str(seq) for seq in missing[:12])
+    if len(missing) > 12:
+        missingPreview += f" +{len(missing) - 12}"
+
+    caption = (
+        f"chunks {dataGot + (1 if headerGot else 0)} / {totalFrames}   "
+        f"data {dataGot}/{dataExpected}   "
+        f"header={'yes' if headerGot else 'no'}"
+    )
+    missingCaption = f"missing: {missingPreview}" if missing else "missing: none"
+
+    cv2.putText(
+        display,
+        caption,
+        (margin, panelTop + 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (235, 235, 235),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        display,
+        missingCaption,
+        (margin, panelTop + 52),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (160, 170, 255) if missing else (140, 210, 140),
+        1,
+        cv2.LINE_AA,
+    )
+
+    barX = margin
+    barY = height - 22
+    barW = max(1, width - margin * 2)
+    barH = 12
+    cv2.rectangle(display, (barX, barY), (barX + barW, barY + barH), (70, 68, 64), -1, cv2.LINE_AA)
+
+    for seq in range(totalFrames):
+        x0 = barX + int(seq * barW / totalFrames)
+        x1 = barX + int((seq + 1) * barW / totalFrames)
+        if x1 <= x0:
+            x1 = x0 + 1
+
+        got = headerGot if seq == 0 else seq in chunkMap
+        if got:
+            color = (70, 190, 80)
+        else:
+            color = (70, 70, 200)
+        cv2.rectangle(display, (x0, barY), (x1, barY + barH), color, -1)
+
+        if lastSeenSeq is not None and seq == lastSeenSeq:
+            cv2.rectangle(display, (x0, barY - 3), (x1, barY + barH + 3), (255, 255, 255), 1, cv2.LINE_AA)
+
+    return display
+
+
+def scaleFrameToFit(frame: np.ndarray, maxWidth: int = 1400, maxHeight: int = 900) -> np.ndarray:
+    """Large preview that keeps the camera's native aspect ratio (no stretch)."""
+    height, width = frame.shape[:2]
+    if width <= 0 or height <= 0:
+        return frame
+
+    scale = min(maxWidth / float(width), maxHeight / float(height))
+    newWidth = max(1, int(round(width * scale)))
+    newHeight = max(1, int(round(height * scale)))
+    if newWidth == width and newHeight == height:
+        return frame
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(frame, (newWidth, newHeight), interpolation=interpolation)
+
+
+def tryUnpack(headerMeta, chunkMap, outputPath: Path) -> bool:
+    if headerMeta is None:
+        return False
+    total = int(headerMeta["total"])
+    if len(chunkMap) != total - 1:
+        return False
+    print("\nAll frames received. Rebuilding archive...")
+    archiveBytes = rebuildArchive(headerMeta, chunkMap)
+    dest = unpackArchive(archiveBytes, str(outputPath))
+    print(f"Done. Restored under: {dest / headerMeta['rootName']}")
+    return True
+
+
+def buildStatusCard(
+    transferId: str,
+    knownTotal: int,
+    headerGot: bool,
+    chunkMap: Dict[int, bytes],
+    roundIndex: int,
+) -> np.ndarray:
+    gotSeqs = list(chunkMap.keys())
+    statusText = encodeStatus(transferId, knownTotal, headerGot, gotSeqs, roundIndex)
+    missing = missingSeqList(headerGot, chunkMap, knownTotal)
+    print(f"Status QR ready ({len(missing)} missing). Camera stays live behind it.")
+    return buildPolaroidCard(
+        buildQrImage(statusText),
+        captionLines=[
+            f"STATUS REPLY   round {roundIndex}",
+            f"got {knownTotal - len(missing)}/{knownTotal}   ·   {transferId}",
+            f"missing {len(missing)}  — aim SENDER camera here",
+        ],
+        progressRatio=(knownTotal - len(missing)) / knownTotal if knownTotal else 1.0,
+        paused=False,
+    )
+
+
+def runReceiver(outputDir: str, cameraIndex: int = 0, statusHold: float = 4.0) -> None:
     outputPath = Path(outputDir).expanduser().resolve()
     outputPath.mkdir(parents=True, exist_ok=True)
 
-    capture = cv2.VideoCapture(cameraIndex)
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open camera index {cameraIndex}")
+    capture = openCamera(cameraIndex)
+    if capture is None:
+        raise RuntimeError(
+            f"Could not open camera index {cameraIndex}. "
+            "Allow Camera access for Terminal or Cursor in System Settings > Privacy."
+        )
 
     detector = cv2.QRCodeDetector()
+    stream = CameraStream(capture)
     headerMeta: Optional[dict] = None
     transferId: Optional[str] = None
     chunkMap: Dict[int, bytes] = {}
     seenPayloads: set[str] = set()
+    windowSized = False
+    knownTotal: Optional[int] = None
+    lastSeenSeq: Optional[int] = None
+    lastReplyRound: Optional[int] = None
+    lastReplyAt = 0.0
+    statusCard = None
 
     windowName = "codeShare Receiver"
-    cv2.namedWindow(windowName, cv2.WINDOW_NORMAL)
+    setupFullscreen(windowName)
 
+    camW = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    camH = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print("\nReceiver ready. Aim camera at sender QR codes.")
+    print(f"Camera mode: {camW}x{camH}")
+    print("Start with 3-way align (QR1 here, QR2 on sender, QR3 here).")
     print("Press [q] to quit.\n")
+
+    aligned = runReceiverAlignment(windowName, stream, detector)
+    if aligned == "quit":
+        stream.stop()
+        capture.release()
+        cv2.destroyAllWindows()
+        return
 
     try:
         while True:
-            ok, frame = capture.read()
-            if not ok:
-                print("Camera read failed.")
-                break
+            frame = stream.read()
+            if frame is None:
+                key = cv2.waitKey(10) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                continue
 
-            rawText, points, _ = detector.detectAndDecode(frame)
-            statusLines = []
+            rawText, points = safeDetectAndDecode(detector, frame)
+            pendingStatusRound = None
 
-            if rawText and rawText not in seenPayloads:
+            if rawText:
                 payload = decodeFrame(rawText)
                 if payload is not None:
-                    seenPayloads.add(rawText)
                     kind = payload["kind"]
-                    seq = int(payload["seq"])
+                    if kind == "align":
+                        continue
                     total = int(payload["total"])
                     frameTransferId = str(payload["transferId"])
+                    knownTotal = total
 
                     if transferId is None:
                         transferId = frameTransferId
-                    elif frameTransferId != transferId:
-                        statusLines.append("Ignoring different transferId")
-                    else:
-                        if kind == "header" and headerMeta is None:
-                            headerMeta = payload
-                            print(
-                                f"Header: root={payload.get('rootName')} "
-                                f"size={humanSize(int(payload['byteSize']))} "
-                                f"frames={total}"
-                            )
-                        elif kind == "data" and seq not in chunkMap:
-                            chunkBytes = validateDataFrame(payload)
-                            if chunkBytes is not None:
-                                chunkMap[seq] = chunkBytes
-                                print(f"Got frame {seq}/{total - 1} data  ({len(chunkMap)}/{total - 1})")
 
-            if points is not None and len(points):
-                pts = points.astype(int)
-                for pointSet in pts:
-                    cv2.polylines(frame, [pointSet], True, (0, 255, 0), 2)
+                    if frameTransferId != transferId:
+                        print(f"Ignoring different transferId: {frameTransferId}")
+                    elif kind in ("ackRequest", "statusRequest"):
+                        roundIndex = int(payload.get("round", 0))
+                        canRetry = (time.time() - lastReplyAt) > (statusHold + 2)
+                        if roundIndex != lastReplyRound or canRetry:
+                            pendingStatusRound = roundIndex
+                            print(f"ACK QR detected (round {roundIndex}). Showing status.")
+                    elif kind in ("header", "data"):
+                        seq = int(payload["seq"])
+                        lastSeenSeq = seq
+                        if rawText not in seenPayloads:
+                            seenPayloads.add(rawText)
+                            if kind == "header" and headerMeta is None:
+                                headerMeta = payload
+                                print(
+                                    f"Header: root={payload.get('rootName')} "
+                                    f"size={humanSize(int(payload['byteSize']))} "
+                                    f"frames={total}"
+                                )
+                            elif kind == "data" and seq not in chunkMap:
+                                chunkBytes = validateDataFrame(payload)
+                                if chunkBytes is not None:
+                                    chunkMap[seq] = chunkBytes
+                                    print(
+                                        f"Got data frame seq={seq}  "
+                                        f"({len(chunkMap)}/{total - 1} collected)"
+                                    )
+                        if payload.get("passEnd"):
+                            roundIndex = int(payload.get("round", 0))
+                            canRetry = (time.time() - lastReplyAt) > (statusHold + 2)
+                            if roundIndex != lastReplyRound or canRetry:
+                                pendingStatusRound = roundIndex
+                                print(f"Last frame of round {roundIndex} detected. Overlaying status QR.")
+                        elif statusCard is not None:
+                            statusCard = None
 
-            receivedData = len(chunkMap)
-            expectedData = int(headerMeta["total"]) - 1 if headerMeta else "?"
-            progress = f"id={transferId or '-'}  data={receivedData}/{expectedData}  header={'yes' if headerMeta else 'no'}"
-            cv2.putText(
-                frame,
-                progress,
-                (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            for lineIndex, line in enumerate(statusLines):
-                cv2.putText(
-                    frame,
-                    line,
-                    (16, 64 + lineIndex * 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 165, 255),
-                    2,
-                    cv2.LINE_AA,
+            if pendingStatusRound is not None and transferId and knownTotal:
+                statusCard = buildStatusCard(
+                    transferId,
+                    knownTotal,
+                    headerMeta is not None,
+                    chunkMap,
+                    pendingStatusRound,
                 )
+                lastReplyRound = pendingStatusRound
+                lastReplyAt = time.time()
 
-            cv2.imshow(windowName, frame)
+            display = frame.copy()
+            drawQrOutline(display, points)
+            preview = scaleFrameToFit(display)
+            preview = drawChunkOverlay(
+                preview,
+                headerGot=headerMeta is not None,
+                chunkMap=chunkMap,
+                totalFrames=knownTotal,
+                lastSeenSeq=lastSeenSeq,
+            )
+            if statusCard is not None:
+                preview = composeQrOverCamera(preview, statusCard)
+            showOnSender(windowName, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
 
-            if headerMeta is not None:
-                total = int(headerMeta["total"])
-                if len(chunkMap) == total - 1:
-                    print("\nAll frames received. Rebuilding archive...")
-                    archiveBytes = rebuildArchive(headerMeta, chunkMap)
-                    dest = unpackArchive(archiveBytes, str(outputPath))
-                    print(f"Done. Restored under: {dest / headerMeta['rootName']}")
-                    break
+            if tryUnpack(headerMeta, chunkMap, outputPath):
+                break
     finally:
+        stream.stop()
         capture.release()
         cv2.destroyAllWindows()

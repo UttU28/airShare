@@ -8,7 +8,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_QR_DIR = PROJECT_ROOT / "qrFrames"
-DEFAULT_SHARE_DIR = Path("/Users/antonio/Desktop/homeLabOps")
+DEFAULT_RECEIVE_DIR = PROJECT_ROOT / "received"
+DEFAULT_SHARE_DIR = Path("/Users/antonio/Desktop/amit")
+DEFAULT_CAMERA_INDEX = 0
+DEFAULT_FRAME_DELAY = 0.5
+DEFAULT_STATUS_HOLD = 4.0
+DEFAULT_STATUS_SCAN = 20.0
 
 
 def promptChoice(promptText: str, allowed: set[str]) -> str:
@@ -57,15 +62,27 @@ def runSendMode() -> None:
     print(f"Sharing directory: {sourcePath}")
     print(f"QR PNGs will be saved to: {saveDir}")
 
-    runSender(sourcePath, frameDelay=0.8, saveDir=saveDir)
+    runSender(
+        sourcePath,
+        frameDelay=DEFAULT_FRAME_DELAY,
+        saveDir=saveDir,
+        cameraIndex=DEFAULT_CAMERA_INDEX,
+        statusHold=DEFAULT_STATUS_HOLD,
+        statusScan=DEFAULT_STATUS_SCAN,
+    )
 
 
 def runReceiveMode() -> None:
     from receiver import runReceiver
 
-    outputDir = promptPath("Output folder for restored directory: ")
-    cameraIndex = promptInt("Camera index", 0)
-    runReceiver(outputDir, cameraIndex=cameraIndex)
+    outputDir = str(DEFAULT_RECEIVE_DIR)
+    print(f"Restoring into: {outputDir}")
+    print(f"Camera index: {DEFAULT_CAMERA_INDEX}")
+    runReceiver(
+        outputDir,
+        cameraIndex=DEFAULT_CAMERA_INDEX,
+        statusHold=DEFAULT_STATUS_SCAN,
+    )
 
 
 def printBanner() -> None:
@@ -80,7 +97,13 @@ def printBanner() -> None:
 
 def main() -> int:
     printBanner()
-    choice = promptChoice("Select option: ", {"1", "2", "q"})
+    if len(sys.argv) > 1:
+        choice = sys.argv[1].strip().lower()
+        if choice not in {"1", "2", "q"}:
+            print(f"Unknown option: {sys.argv[1]}  (use 1, 2, or q)")
+            choice = promptChoice("Select option: ", {"1", "2", "q"})
+    else:
+        choice = promptChoice("Select option: ", {"1", "2", "q"})
 
     if choice == "q":
         print("Bye.")
