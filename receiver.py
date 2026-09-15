@@ -402,8 +402,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                         statusCard = None
                         doneCard = None
                         fileSaved = False
-
-                    knownTotal = total
+                        knownTotal = total
 
                     if frameTransferId != transferId:
                         if frameTransferId != lastIgnoreId:
@@ -419,6 +418,11 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                             pendingStatusRound = roundIndex
                             print(f"ACK QR detected (round {roundIndex}). Showing status.")
                     elif kind in ("header", "data", "dataPart") and not fileSaved:
+                        if statusCard is not None:
+                            statusCard = None
+                            statusFingerprint = None
+                            lastReplyRound = None
+                        knownTotal = total
                         seq = int(payload["seq"])
                         lastSeenSeq = seq
                         if kind == "header" and headerMeta is None:

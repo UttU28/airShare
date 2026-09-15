@@ -414,6 +414,8 @@ def sendUntilComplete(
                     scanRoi=scanRoi,
                     stream=stream,
                     detector=detector,
+                    expectedRound=roundIndex,
+                    expectedTotal=totalFrames,
                 )
                 if statusPayload == "quit":
                     return "quit"
@@ -891,6 +893,8 @@ def freezeOnLastUntilStatus(
     scanRoi: QrScanRoi | None = None,
     stream: CameraStream | None = None,
     detector=None,
+    expectedRound: int | None = None,
+    expectedTotal: int | None = None,
 ):
     """Show last QR and scan for status at the same time. Camera stays open for the session."""
     print("Frozen on last frame. Scanning receiver status...")
@@ -947,12 +951,19 @@ def freezeOnLastUntilStatus(
                 continue
             if str(payload.get("transferId")) != transferId:
                 continue
-            if payload.get("kind") == "done":
-                print("Receiver FILE COMPLETE QR matched this transferId.")
-            else:
+            if expectedTotal is not None and int(payload.get("total") or -1) != int(expectedTotal):
+                continue
+            if payload.get("kind") == "status":
+                statusRound = int(payload.get("round") or -1)
+                if expectedRound is not None and statusRound != int(expectedRound):
+                    continue
                 print(
-                    f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
+                    f"Got status round {statusRound}: "
+                    f"{payload.get('gotCount')}/{payload.get('total')} chunks on receiver"
                 )
+                return payload
+            doneIndex = payload.get("fileIndex")
+            print("Receiver FILE COMPLETE QR matched this transferId.")
             return payload
     finally:
         if ownsCamera:
