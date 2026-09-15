@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from packer import humanSize, writeReceivedDir, writeReceivedFile
-from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame
+from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame, validateDataPart
 from sender import (
     CameraStream,
     QrScanRoi,
@@ -255,6 +255,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     headerMeta: Optional[dict] = None
     transferId: Optional[str] = None
     chunkMap: Dict[int, bytes] = {}
+    partMap: Dict[int, Dict[int, bytes]] = {}
     seenPayloads: set[str] = set()
     knownTotal: Optional[int] = None
     lastSeenSeq: Optional[int] = None
@@ -325,6 +326,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                         transferId = frameTransferId
                         headerMeta = None
                         chunkMap = {}
+                        partMap = {}
                         seenPayloads = set()
                         lastSeenSeq = None
                         lastReplyRound = None
@@ -345,7 +347,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                         if roundIndex != lastReplyRound or canRetry:
                             pendingStatusRound = roundIndex
                             print(f"ACK QR detected (round {roundIndex}). Showing status.")
-                    elif kind in ("header", "data") and not fileSaved:
+                    elif kind in ("header", "data", "dataPart") and not fileSaved:
                         seq = int(payload["seq"])
                         lastSeenSeq = seq
                         if rawText not in seenPayloads:
@@ -366,6 +368,28 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                                         f"Got data frame seq={seq}  "
                                         f"({len(chunkMap)}/{total - 1} collected)"
                                     )
+                            elif kind == "dataPart" and seq not in chunkMap:
+                                parsed = validateDataPart(payload)
+                                if parsed is not None:
+                                    partSeq, partIndex, partCount, partBytes = parsed
+                                    bucket = partMap.setdefault(partSeq, {})
+                                    if partIndex not in bucket:
+                                        bucket[partIndex] = partBytes
+                                        print(
+                                            f"Got split piece seq={partSeq} "
+                                            f"part {partIndex + 1}/{partCount}"
+                                        )
+                                    if len(bucket) >= partCount and all(
+                                        index in bucket for index in range(partCount)
+                                    ):
+                                        chunkMap[partSeq] = b"".join(
+                                            bucket[index] for index in range(partCount)
+                                        )
+                                        partMap.pop(partSeq, None)
+                                        print(
+                                            f"Reassembled seq={partSeq} from {partCount} pieces  "
+                                            f"({len(chunkMap)}/{total - 1} collected)"
+                                        )
 
             if pendingStatusRound is not None and transferId and knownTotal:
                 statusCard = buildStatusCard(

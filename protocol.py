@@ -88,6 +88,37 @@ def encodeDataFrame(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def splitBytes(data: bytes, parts: int) -> List[bytes]:
+    if parts <= 1 or len(data) <= 1:
+        return [data]
+    parts = min(int(parts), len(data))
+    piece = (len(data) + parts - 1) // parts
+    chunks = [data[index * piece : (index + 1) * piece] for index in range(parts)]
+    return [chunk for chunk in chunks if chunk]
+
+
+def encodeDataPartFrame(
+    transferId: str,
+    seq: int,
+    total: int,
+    partIndex: int,
+    partCount: int,
+    partBytes: bytes,
+) -> str:
+    payload = {
+        "magic": MAGIC,
+        "kind": "dataPart",
+        "transferId": transferId,
+        "seq": seq,
+        "total": total,
+        "part": int(partIndex),
+        "parts": int(partCount),
+        "checksum": shortChecksum(partBytes),
+        "data": base64.b64encode(partBytes).decode("ascii"),
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
 def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
     try:
         payload = json.loads(rawText)
@@ -99,7 +130,16 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
     if payload.get("magic") != MAGIC:
         return None
     kind = payload.get("kind")
-    if kind not in ("header", "data", "status", "align", "ackRequest", "done", "sessionDone"):
+    if kind not in (
+        "header",
+        "data",
+        "dataPart",
+        "status",
+        "align",
+        "ackRequest",
+        "done",
+        "sessionDone",
+    ):
         return None
     if kind == "align":
         if "step" not in payload or "handshakeId" not in payload:
@@ -107,7 +147,9 @@ def decodeFrame(rawText: str) -> Optional[Dict[str, Any]]:
         return payload
     if "transferId" not in payload:
         return None
-    if kind in ("header", "data") and ("seq" not in payload or "total" not in payload):
+    if kind in ("header", "data", "dataPart") and ("seq" not in payload or "total" not in payload):
+        return None
+    if kind == "dataPart" and ("part" not in payload or "parts" not in payload):
         return None
     if kind in ("status", "ackRequest", "done") and "total" not in payload:
         return None
@@ -217,6 +259,27 @@ def validateDataFrame(payload: Dict[str, Any]) -> Optional[bytes]:
     if shortChecksum(chunkBytes) != checksum:
         return None
     return chunkBytes
+
+
+def validateDataPart(payload: Dict[str, Any]) -> Optional[tuple[int, int, int, bytes]]:
+    if payload.get("kind") != "dataPart":
+        return None
+    encoded = payload.get("data")
+    checksum = payload.get("checksum")
+    if not isinstance(encoded, str) or not isinstance(checksum, str):
+        return None
+    try:
+        partBytes = base64.b64decode(encoded, validate=True)
+        partIndex = int(payload["part"])
+        partCount = int(payload["parts"])
+        seq = int(payload["seq"])
+    except Exception:
+        return None
+    if partCount < 2 or partIndex < 0 or partIndex >= partCount:
+        return None
+    if shortChecksum(partBytes) != checksum:
+        return None
+    return seq, partIndex, partCount, partBytes
 
 
 def rebuildArchive(headerMeta: Dict[str, Any], chunkMap: Dict[int, bytes]) -> bytes:

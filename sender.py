@@ -20,11 +20,13 @@ from protocol import (
     encodeAckRequest,
     encodeAlign,
     encodeDataFrame,
+    encodeDataPartFrame,
     encodeHeaderFrame,
     encodeSessionDone,
     makeTransferId,
     missingSeqsFromStatus,
     packBytePayload,
+    splitBytes,
 )
 
 
@@ -243,6 +245,7 @@ def buildEntryFrames(
         "byteSize": len(payloadBytes),
         "totalFrames": total,
         "humanSize": humanSize(len(payloadBytes)),
+        "chunksBySeq": {index + 1: chunk for index, chunk in enumerate(dataChunks)},
     }
     return frames, summary
 
@@ -284,6 +287,7 @@ def buildCalibrateFrames(sessionId: str, realFileCount: int) -> tuple[List[str],
         "byteSize": len(payloadBytes),
         "totalFrames": total,
         "humanSize": humanSize(len(payloadBytes)),
+        "chunksBySeq": {index + 1: chunk for index, chunk in enumerate(dataChunks)},
     }
     return frames, summary
 
@@ -305,29 +309,62 @@ def sendUntilComplete(
     pending = list(range(totalFrames))
     roundIndex = 1
     previousMissing = None
+    sameMissingCount = 0
+    splitParts = 1
+    baseDelay = frameDelay
+    chunksBySeq = summary.get("chunksBySeq") or {}
     fileLabel = f"{summary['fileIndex']}/{summary['fileCount']}  {summary['relPath']}"
     try:
         while pending:
+            modeNote = (
+                f"  split x{splitParts}" if splitParts > 1 else ""
+            )
             print(
                 f"\n--- {fileLabel}  round {roundIndex}: "
-                f"{len(pending)} pending  interval={frameDelay:.2f}s ---"
+                f"{len(pending)} pending  interval={frameDelay:.2f}s{modeNote} ---"
             )
             lastSeq = pending[-1]
-            for playIndex, seq in enumerate(pending):
-                qrPrefetch.prefetchAround(pending, playIndex)
-                progressRatio = (playIndex + 1) / len(pending)
+            playQueue = []
+            for seq in pending:
+                rawChunk = chunksBySeq.get(seq)
+                if seq == 0 or splitParts <= 1 or not rawChunk:
+                    playQueue.append((seq, frames[seq], "full"))
+                else:
+                    pieces = splitBytes(rawChunk, splitParts)
+                    for partIndex, piece in enumerate(pieces):
+                        playQueue.append(
+                            (
+                                seq,
+                                encodeDataPartFrame(
+                                    transferId,
+                                    seq,
+                                    totalFrames,
+                                    partIndex,
+                                    len(pieces),
+                                    piece,
+                                ),
+                                f"half-QR {partIndex + 1}/{len(pieces)}",
+                            )
+                        )
+
+            for playIndex, (seq, payloadText, partLabel) in enumerate(playQueue):
+                progressRatio = (playIndex + 1) / len(playQueue)
                 captionLines = [
                     f"{summary['rootName']}  {fileLabel}",
-                    f"seq {seq}  {playIndex + 1}/{len(pending)}  ·  {transferId}",
+                    f"seq {seq}  {playIndex + 1}/{len(playQueue)}  {partLabel}  ·  {transferId}",
                     f"{summary['humanSize']}  ·  playing",
                 ]
+                if partLabel == "full":
+                    qrPrefetch.warm([seq])
+                    qrImage = qrPrefetch.get(seq)
+                else:
+                    qrImage = buildQrImage(payloadText)
                 card = buildPolaroidCard(
-                    qrPrefetch.get(seq),
+                    qrImage,
                     captionLines=captionLines,
                     progressRatio=progressRatio,
                     paused=False,
                 )
-                qrPrefetch.drop(seq)
                 showOnSender(windowName, card)
                 hold = frameDelay
                 if seq == 0:
@@ -381,11 +418,28 @@ def sendUntilComplete(
                     print("Receiver has all chunks. Waiting for FILE COMPLETE QR...")
                     continue
                 if previousMissing is not None and pending == previousMissing:
-                    frameDelay += 0.5
-                    print(
-                        f"Missing set unchanged. Interval +0.5s → {frameDelay:.2f}s "
-                        "(kept for later rounds of this file)."
-                    )
+                    sameMissingCount += 1
+                    if sameMissingCount >= 3:
+                        splitParts = min(8, max(2, splitParts * 2))
+                        frameDelay = baseDelay
+                        sameMissingCount = 0
+                        print(
+                            f"Same missing set 3 times. Interval reset to {baseDelay:.2f}s. "
+                            f"Sending stuck chunks as {splitParts} smaller QRs "
+                            "(original chunk size restored after this file)."
+                        )
+                    else:
+                        frameDelay += 0.5
+                        print(
+                            f"Missing set unchanged ({sameMissingCount}/3). "
+                            f"Interval +0.5s → {frameDelay:.2f}s"
+                        )
+                else:
+                    if previousMissing is not None and splitParts > 1:
+                        print("Missing set changed. Restoring full-size data QRs.")
+                    sameMissingCount = 0
+                    splitParts = 1
+                    frameDelay = baseDelay
                 previousMissing = list(pending)
                 roundIndex += 1
                 break
