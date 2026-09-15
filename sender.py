@@ -13,7 +13,7 @@ import numpy as np
 import qrcode
 from qrcode.constants import ERROR_CORRECT_M
 
-from packer import humanSize, listShareEntries
+from packer import buildPackBytes, buildTransferJobs, humanSize
 from protocol import (
     DEFAULT_CHUNK_SIZE,
     decodeFrame,
@@ -31,6 +31,9 @@ from protocol import (
 
 
 SCREEN_SIZE = {"w": 1920, "h": 1080}
+HEADER_HOLD_SECONDS = 0.75
+ALIGN_HOLD_SECONDS = 1.6
+_CLAHE = None
 
 
 def setupFullscreen(windowName: str) -> None:
@@ -214,8 +217,16 @@ def buildEntryFrames(
     transferId = makeTransferId()
     if entry["kind"] == "dir":
         payloadBytes = b""
+        relPath = entry["relPath"]
+        entryKind = "dir"
+    elif entry["kind"] == "pack":
+        payloadBytes = buildPackBytes(entry["entries"])
+        relPath = f"_pack_{fileIndex:04d}.tgz"
+        entryKind = "pack"
     else:
         payloadBytes = entry["absPath"].read_bytes()
+        relPath = entry["relPath"]
+        entryKind = "file"
 
     headerMeta, dataChunks = packBytePayload(
         payloadBytes,
@@ -223,10 +234,11 @@ def buildEntryFrames(
         extraMeta={
             "sessionId": sessionId,
             "rootName": rootName,
-            "relPath": entry["relPath"],
-            "entryKind": entry["kind"],
+            "relPath": relPath,
+            "entryKind": entryKind,
             "fileIndex": fileIndex,
             "fileCount": fileCount,
+            "packFiles": len(entry["entries"]) if entryKind == "pack" else 1,
         },
     )
     frames: List[str] = [encodeHeaderFrame(headerMeta)]
@@ -238,8 +250,8 @@ def buildEntryFrames(
         "sessionId": sessionId,
         "transferId": transferId,
         "rootName": rootName,
-        "relPath": entry["relPath"],
-        "entryKind": entry["kind"],
+        "relPath": relPath,
+        "entryKind": entryKind,
         "fileIndex": fileIndex,
         "fileCount": fileCount,
         "byteSize": len(payloadBytes),
@@ -299,6 +311,8 @@ def sendUntilComplete(
     frameDelay: float,
     cameraIndex: int,
     scanRoi: QrScanRoi | None = None,
+    stream: CameraStream | None = None,
+    detector=None,
 ) -> str:
     """Play one file's frames until receiver done or quit. Returns complete|quit."""
     if scanRoi is None:
@@ -355,7 +369,12 @@ def sendUntilComplete(
                     f"{summary['humanSize']}  ·  playing",
                 ]
                 if partLabel == "full":
-                    qrPrefetch.warm([seq])
+                    upcoming = [
+                        item[0]
+                        for item in playQueue[playIndex : playIndex + 12]
+                        if item[2] == "full"
+                    ]
+                    qrPrefetch.warm(upcoming)
                     qrImage = qrPrefetch.get(seq)
                 else:
                     qrImage = buildQrImage(payloadText)
@@ -368,7 +387,7 @@ def sendUntilComplete(
                 showOnSender(windowName, card)
                 hold = frameDelay
                 if seq == 0:
-                    hold = max(frameDelay, 1.5)
+                    hold = max(frameDelay, HEADER_HOLD_SECONDS)
                 if waitForFrame(hold) == "quit":
                     return "quit"
 
@@ -393,6 +412,8 @@ def sendUntilComplete(
                     transferId,
                     cameraIndex,
                     scanRoi=scanRoi,
+                    stream=stream,
+                    detector=detector,
                 )
                 if statusPayload == "quit":
                     return "quit"
@@ -448,9 +469,16 @@ def sendUntilComplete(
         qrPrefetch.close()
 
 
-def safeDetectAndDecode(detector, frame):
+def _clahe():
+    global _CLAHE
+    if _CLAHE is None:
+        _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return _CLAHE
+
+
+def _detectOnce(detector, image):
     try:
-        rawText, points, _straight = detector.detectAndDecode(frame)
+        rawText, points, _straight = detector.detectAndDecode(image)
     except cv2.error:
         return "", None
     except Exception:
@@ -458,6 +486,29 @@ def safeDetectAndDecode(detector, frame):
     if not rawText:
         rawText = ""
     return rawText, points
+
+
+def safeDetectAndDecode(detector, frame):
+    """Try color, then gray, then contrast — stuck QRs often decode on the second pass."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return "", None
+    rawText, points = _detectOnce(detector, frame)
+    if rawText:
+        return rawText, points
+    if len(frame.shape) == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame
+    rawText, points = _detectOnce(detector, gray)
+    if rawText:
+        return rawText, points
+    height, width = gray.shape[:2]
+    if height * width <= 800 * 800:
+        enhanced = _clahe().apply(gray)
+        rawText, points = _detectOnce(detector, enhanced)
+        if rawText:
+            return rawText, points
+    return "", points
 
 
 class QrScanRoi:
@@ -663,17 +714,16 @@ def makeAlignCard(step: int, handshakeId: str, caption: str) -> np.ndarray:
     )
 
 
-def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | None = None):
+def runSenderAlignment(
+    windowName: str,
+    stream: CameraStream,
+    detector,
+    scanRoi: QrScanRoi | None = None,
+):
     """QR1 from receiver, then QR2 and last QR3 from sender. Receiver stays aimed at sender."""
     print("Alignment: camera only until QR 1. Then sender shows QR 2, then last QR 3.")
     if scanRoi is None:
         scanRoi = QrScanRoi()
-    capture = openCamera(cameraIndex)
-    if capture is None:
-        raise RuntimeError("Could not open sender camera for alignment.")
-
-    stream = CameraStream(capture)
-    detector = cv2.QRCodeDetector()
     handshakeId = None
     alignCard = None
     phase = "scan1"
@@ -681,8 +731,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
     lastQr1Id = None
     neededHits = 3
     holdUntil = 0.0
-    try:
-        while True:
+    while True:
             frame = stream.read(scanRoi.captureBox())
             if frame is None:
                 key = cv2.waitKey(10) & 0xFF
@@ -714,7 +763,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
                             "Sender QR 2 — receiver should scan this",
                         )
                         phase = "show2"
-                        holdUntil = time.time() + 2.8
+                        holdUntil = time.time() + ALIGN_HOLD_SECONDS
                 else:
                     qr1Hits = 0
                     lastQr1Id = None
@@ -727,7 +776,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
                     "Sender QR 3 LAST — receiver scans this, then data starts",
                 )
                 phase = "show3"
-                holdUntil = time.time() + 2.8
+                holdUntil = time.time() + ALIGN_HOLD_SECONDS
 
             elif phase == "show3" and time.time() >= holdUntil:
                 print("Last sender QR shown. Handshake complete. Starting data.")
@@ -766,9 +815,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 return "quit"
-    finally:
-        stream.stop()
-        capture.release()
+    return handshakeId
 
 
 def runReceiverAlignment(
@@ -830,12 +877,9 @@ def runReceiverAlignment(
 
 def waitForFrame(duration: float) -> str:
     """Hold a QR on screen. Returns quit if q/esc is pressed."""
-    deadline = time.time() + duration
-    while time.time() < deadline:
-        remainingMs = max(1, int((deadline - time.time()) * 1000))
-        key = cv2.waitKey(min(remainingMs, 50)) & 0xFF
-        if key in (ord("q"), 27):
-            return "quit"
+    key = cv2.waitKey(max(1, int(duration * 1000))) & 0xFF
+    if key in (ord("q"), 27):
+        return "quit"
     return "ok"
 
 
@@ -845,19 +889,25 @@ def freezeOnLastUntilStatus(
     transferId: str,
     cameraIndex: int,
     scanRoi: QrScanRoi | None = None,
+    stream: CameraStream | None = None,
+    detector=None,
 ):
-    """Show last QR and scan for status at the same time. Camera thread never sleeps."""
-    print("Frozen on last frame. Camera stays live under the QR overlay until status is read.")
+    """Show last QR and scan for status at the same time. Camera stays open for the session."""
+    print("Frozen on last frame. Scanning receiver status...")
     if scanRoi is None:
         scanRoi = QrScanRoi()
-    capture = openCamera(cameraIndex)
-    if capture is None:
-        print(f"Could not open camera {cameraIndex} for status scan.")
-        print("Allow Camera for Terminal/Cursor in System Settings > Privacy, then retry.")
-        return None
-
-    stream = CameraStream(capture)
-    detector = cv2.QRCodeDetector()
+    ownsCamera = stream is None
+    capture = None
+    if stream is None:
+        capture = openCamera(cameraIndex)
+        if capture is None:
+            print(f"Could not open camera {cameraIndex} for status scan.")
+            print("Allow Camera for Terminal/Cursor in System Settings > Privacy, then retry.")
+            return None
+        stream = CameraStream(capture)
+        detector = cv2.QRCodeDetector()
+    if detector is None:
+        detector = cv2.QRCodeDetector()
     startedAt = time.time()
     try:
         while True:
@@ -905,8 +955,10 @@ def freezeOnLastUntilStatus(
                 )
             return payload
     finally:
-        stream.stop()
-        capture.release()
+        if ownsCamera:
+            stream.stop()
+            if capture is not None:
+                capture.release()
 
 
 def runSender(
@@ -919,31 +971,46 @@ def runSender(
 
         frameDelay = DEFAULT_FRAME_DELAY
 
-    print("\nListing files (one file per transfer, written as it completes)...")
-    rootName, _rootPath, entries = listShareEntries(sourcePath)
+    print("\nListing files (small files packed together to cut ACK round-trips)...")
+    rootName, jobs, fileCount = buildTransferJobs(sourcePath)
     sessionId = makeTransferId()
-    fileCount = len(entries)
-    totalBytes = sum(int(entry["byteSize"]) for entry in entries)
+    jobCount = len(jobs)
+    totalBytes = sum(int(job.get("byteSize") or 0) for job in jobs)
     print(f"Session ID  : {sessionId}")
     print(f"Root name   : {rootName}")
     print(f"Files/dirs  : {fileCount}")
+    print(f"Transfers   : {jobCount}  (packs + large files)")
     print(f"Total data  : {humanSize(totalBytes)}")
-    print("Each file is ACK'd and saved before the next one starts.")
 
     windowName = "codeShare Sender"
     scanRoi = QrScanRoi()
+    capture = openCamera(cameraIndex)
+    if capture is None:
+        raise RuntimeError(
+            f"Could not open camera index {cameraIndex}. "
+            "Allow Camera access for Terminal or Cursor in System Settings > Privacy."
+        )
+    stream = CameraStream(capture)
+    detector = cv2.QRCodeDetector()
     try:
         setupFullscreen(windowName)
-        aligned = runSenderAlignment(windowName, cameraIndex, scanRoi=scanRoi)
+        aligned = runSenderAlignment(windowName, stream, detector, scanRoi=scanRoi)
         if aligned == "quit":
             print("Sender stopped.")
             return
 
         print("\nCalibration file: 10 QR frames to lock a FIXED search crop.")
         scanRoi.beginCalibrate()
-        calFrames, calSummary = buildCalibrateFrames(sessionId, fileCount)
+        calFrames, calSummary = buildCalibrateFrames(sessionId, jobCount)
         calResult = sendUntilComplete(
-            windowName, calFrames, calSummary, frameDelay, cameraIndex, scanRoi=scanRoi
+            windowName,
+            calFrames,
+            calSummary,
+            frameDelay,
+            cameraIndex,
+            scanRoi=scanRoi,
+            stream=stream,
+            detector=detector,
         )
         if calResult == "quit":
             print("Sender stopped.")
@@ -953,34 +1020,44 @@ def runSender(
         print(f"\nFrame interval: {frameDelay:.2f}s")
         print("Press [q] to quit.\n")
 
-        for fileIndex, entry in enumerate(entries, start=1):
+        for fileIndex, entry in enumerate(jobs, start=1):
+            label = entry.get("relPath") or entry.get("kind")
             print(
-                f"\n===== File {fileIndex}/{fileCount}: {entry['relPath']} "
+                f"\n===== Transfer {fileIndex}/{jobCount}: {label} "
                 f"({humanSize(entry['byteSize'])}) ====="
             )
             frames, summary = buildEntryFrames(
-                entry, sessionId, rootName, fileIndex, fileCount
+                entry, sessionId, rootName, fileIndex, jobCount
             )
             result = sendUntilComplete(
-                windowName, frames, summary, frameDelay, cameraIndex, scanRoi=scanRoi
+                windowName,
+                frames,
+                summary,
+                frameDelay,
+                cameraIndex,
+                scanRoi=scanRoi,
+                stream=stream,
+                detector=detector,
             )
             if result == "quit":
                 print("Sender stopped.")
                 return
 
-        sessionText = encodeSessionDone(sessionId, fileCount)
+        sessionText = encodeSessionDone(sessionId, jobCount)
         doneCard = buildPolaroidCard(
             buildQrImage(sessionText),
             captionLines=[
                 "SESSION COMPLETE",
-                f"{fileCount} files  ·  {sessionId}",
+                f"{fileCount} files in {jobCount} transfers  ·  {sessionId}",
                 "All files received. Quitting.",
             ],
             progressRatio=1.0,
             paused=False,
         )
         showOnSender(windowName, doneCard)
-        cv2.waitKey(2000)
+        cv2.waitKey(1500)
         print("All files sent. Sender stopped.")
     finally:
+        stream.stop()
+        capture.release()
         cv2.destroyAllWindows()

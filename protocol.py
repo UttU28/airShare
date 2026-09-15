@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 MAGIC = "CS01"
 # Small payloads keep QR version low so modules stay large on screen (easier under glare).
-DEFAULT_CHUNK_SIZE = 400
+DEFAULT_CHUNK_SIZE = 320
 HEADER_SEQ = 0
 
 

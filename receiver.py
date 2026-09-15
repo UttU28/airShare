@@ -9,7 +9,7 @@ import time
 import cv2
 import numpy as np
 
-from packer import humanSize, writeReceivedDir, writeReceivedFile
+from packer import humanSize, unpackPackBytes, writeReceivedDir, writeReceivedFile
 from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame, validateDataPart
 from sender import (
     CameraStream,
@@ -26,7 +26,7 @@ from sender import (
 )
 
 
-ACK_RETRY_SECONDS = 3.0
+ACK_RETRY_SECONDS = 1.0
 
 
 def missingSeqList(headerGot: bool, chunkMap: Dict[int, bytes], totalFrames: int) -> list[int]:
@@ -113,6 +113,12 @@ def drawChunkOverlay(
     barH = 12
     cv2.rectangle(display, (barX, barY), (barX + barW, barY + barH), (70, 68, 64), -1, cv2.LINE_AA)
 
+    if totalFrames > 240:
+        gotCount = dataGot + (1 if headerGot else 0)
+        fill = max(1, int(barW * gotCount / float(totalFrames)))
+        cv2.rectangle(display, (barX, barY), (barX + fill, barY + barH), (70, 190, 80), -1)
+        return display
+
     for seq in range(totalFrames):
         x0 = barX + int(seq * barW / totalFrames)
         x1 = barX + int((seq + 1) * barW / totalFrames)
@@ -130,6 +136,60 @@ def drawChunkOverlay(
             cv2.rectangle(display, (x0, barY - 3), (x1, barY + barH + 3), (255, 255, 255), 1, cv2.LINE_AA)
 
     return display
+
+
+def composeReceiverMonitor(
+    cameraCrop: np.ndarray,
+    points,
+    headerGot: bool,
+    chunkMap: Dict[int, bytes],
+    totalFrames: Optional[int],
+    lastSeenSeq: Optional[int],
+) -> np.ndarray:
+    """Full-width UI; only the camera pane is the QR search crop."""
+    screenW, screenH = screenSize()
+    canvas = np.full((screenH, screenW, 3), (18, 16, 14), dtype=np.uint8)
+    panelHeight = 110
+    camAreaW = screenW
+    camAreaH = max(80, screenH - panelHeight)
+
+    crop = cameraCrop.copy()
+    drawQrOutline(crop, points)
+    cropH, cropW = crop.shape[:2]
+    if cropW > 0 and cropH > 0:
+        scale = min(camAreaW / float(cropW), camAreaH / float(cropH))
+        newW = max(1, int(round(cropW * scale)))
+        newH = max(1, int(round(cropH * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        cam = cv2.resize(crop, (newW, newH), interpolation=interpolation)
+        x0 = (camAreaW - newW) // 2
+        y0 = (camAreaH - newH) // 2
+        canvas[y0 : y0 + newH, x0 : x0 + newW] = cam
+        cv2.rectangle(
+            canvas,
+            (x0 - 2, y0 - 2),
+            (x0 + newW + 1, y0 + newH + 1),
+            (0, 200, 255),
+            2,
+        )
+        cv2.putText(
+            canvas,
+            "QR search crop",
+            (x0, max(22, y0 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 200, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return drawChunkOverlay(
+        canvas,
+        headerGot=headerGot,
+        chunkMap=chunkMap,
+        totalFrames=totalFrames,
+        lastSeenSeq=lastSeenSeq,
+    )
 
 
 def scaleFrameToFit(frame: np.ndarray, maxWidth: int = 1400, maxHeight: int = 900) -> np.ndarray:
@@ -169,6 +229,13 @@ def trySaveFile(headerMeta, chunkMap, outputPath: Path) -> bool:
     if entryKind == "dir":
         dest = writeReceivedDir(str(outputPath), rootName, relPath)
         print(f"Saved empty dir{progress}: {dest}")
+        return True
+
+    if entryKind == "pack":
+        print(f"\nPack complete{progress}. Extracting {headerMeta.get('packFiles', '?')} items...")
+        payloadBytes = rebuildArchive(headerMeta, chunkMap)
+        dest = unpackPackBytes(payloadBytes, str(outputPath), rootName)
+        print(f"Wrote pack {humanSize(len(payloadBytes))} → {dest}")
         return True
 
     print(f"\nFile complete{progress}. Writing {relPath}...")
@@ -225,7 +292,7 @@ def buildStatusCard(
     gotSeqs = list(chunkMap.keys())
     statusText = encodeStatus(transferId, knownTotal, headerGot, gotSeqs, roundIndex)
     missing = missingSeqList(headerGot, chunkMap, knownTotal)
-    print(f"Status QR ready ({len(missing)} missing). Camera stays live behind it.")
+    print(f"Status QR ready ({len(missing)} missing).")
     return buildPolaroidCard(
         buildQrImage(statusText),
         captionLines=[
@@ -256,11 +323,12 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     transferId: Optional[str] = None
     chunkMap: Dict[int, bytes] = {}
     partMap: Dict[int, Dict[int, bytes]] = {}
-    seenPayloads: set[str] = set()
     knownTotal: Optional[int] = None
     lastSeenSeq: Optional[int] = None
     lastReplyRound: Optional[int] = None
     lastReplyAt = 0.0
+    lastIgnoreId: Optional[str] = None
+    statusFingerprint = None
     statusCard = None
     fileSaved = False
     doneCard = None
@@ -327,9 +395,10 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                         headerMeta = None
                         chunkMap = {}
                         partMap = {}
-                        seenPayloads = set()
                         lastSeenSeq = None
                         lastReplyRound = None
+                        lastIgnoreId = None
+                        statusFingerprint = None
                         statusCard = None
                         doneCard = None
                         fileSaved = False
@@ -337,10 +406,12 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                     knownTotal = total
 
                     if frameTransferId != transferId:
-                        print(
-                            f"Still receiving current file; ignoring {kind} "
-                            f"from {frameTransferId}"
-                        )
+                        if frameTransferId != lastIgnoreId:
+                            print(
+                                f"Still receiving current file; ignoring {kind} "
+                                f"from {frameTransferId}"
+                            )
+                            lastIgnoreId = frameTransferId
                     elif kind == "ackRequest":
                         roundIndex = int(payload.get("round", 0))
                         canRetry = (time.time() - lastReplyAt) > ACK_RETRY_SECONDS
@@ -350,72 +421,73 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                     elif kind in ("header", "data", "dataPart") and not fileSaved:
                         seq = int(payload["seq"])
                         lastSeenSeq = seq
-                        if rawText not in seenPayloads:
-                            seenPayloads.add(rawText)
-                            if kind == "header" and headerMeta is None:
-                                headerMeta = payload
-                                print(
-                                    f"Header: {payload.get('relPath')} "
-                                    f"{payload.get('fileIndex')}/{payload.get('fileCount')} "
-                                    f"size={humanSize(int(payload['byteSize']))} "
-                                    f"frames={total}"
-                                )
-                            elif kind == "data" and seq not in chunkMap:
-                                chunkBytes = validateDataFrame(payload)
-                                if chunkBytes is not None:
-                                    chunkMap[seq] = chunkBytes
+                        if kind == "header" and headerMeta is None:
+                            headerMeta = payload
+                            print(
+                                f"Header: {payload.get('relPath')} "
+                                f"{payload.get('fileIndex')}/{payload.get('fileCount')} "
+                                f"size={humanSize(int(payload['byteSize']))} "
+                                f"frames={total}"
+                            )
+                        elif kind == "data" and seq not in chunkMap:
+                            chunkBytes = validateDataFrame(payload)
+                            if chunkBytes is not None:
+                                chunkMap[seq] = chunkBytes
+                                got = len(chunkMap)
+                                if got == total - 1 or got % 8 == 0:
                                     print(
-                                        f"Got data frame seq={seq}  "
+                                        f"Got data seq={seq}  ({got}/{total - 1} collected)"
+                                    )
+                        elif kind == "dataPart" and seq not in chunkMap:
+                            parsed = validateDataPart(payload)
+                            if parsed is not None:
+                                partSeq, partIndex, partCount, partBytes = parsed
+                                bucket = partMap.setdefault(partSeq, {})
+                                if partIndex not in bucket:
+                                    bucket[partIndex] = partBytes
+                                if len(bucket) >= partCount and all(
+                                    index in bucket for index in range(partCount)
+                                ):
+                                    chunkMap[partSeq] = b"".join(
+                                        bucket[index] for index in range(partCount)
+                                    )
+                                    partMap.pop(partSeq, None)
+                                    print(
+                                        f"Reassembled seq={partSeq} from {partCount} pieces  "
                                         f"({len(chunkMap)}/{total - 1} collected)"
                                     )
-                            elif kind == "dataPart" and seq not in chunkMap:
-                                parsed = validateDataPart(payload)
-                                if parsed is not None:
-                                    partSeq, partIndex, partCount, partBytes = parsed
-                                    bucket = partMap.setdefault(partSeq, {})
-                                    if partIndex not in bucket:
-                                        bucket[partIndex] = partBytes
-                                        print(
-                                            f"Got split piece seq={partSeq} "
-                                            f"part {partIndex + 1}/{partCount}"
-                                        )
-                                    if len(bucket) >= partCount and all(
-                                        index in bucket for index in range(partCount)
-                                    ):
-                                        chunkMap[partSeq] = b"".join(
-                                            bucket[index] for index in range(partCount)
-                                        )
-                                        partMap.pop(partSeq, None)
-                                        print(
-                                            f"Reassembled seq={partSeq} from {partCount} pieces  "
-                                            f"({len(chunkMap)}/{total - 1} collected)"
-                                        )
 
             if pendingStatusRound is not None and transferId and knownTotal:
-                statusCard = buildStatusCard(
-                    transferId,
-                    knownTotal,
-                    headerMeta is not None,
-                    chunkMap,
+                fingerprint = (
                     pendingStatusRound,
+                    headerMeta is not None,
+                    len(chunkMap),
                 )
+                if fingerprint != statusFingerprint:
+                    statusCard = buildStatusCard(
+                        transferId,
+                        knownTotal,
+                        headerMeta is not None,
+                        chunkMap,
+                        pendingStatusRound,
+                    )
+                    statusFingerprint = fingerprint
                 lastReplyRound = pendingStatusRound
                 lastReplyAt = time.time()
 
-            display = frame.copy()
-            drawQrOutline(display, points)
-            preview = scaleFrameToFit(display)
-            preview = drawChunkOverlay(
-                preview,
-                headerGot=headerMeta is not None,
-                chunkMap=chunkMap,
-                totalFrames=knownTotal,
-                lastSeenSeq=lastSeenSeq,
-            )
             if statusCard is not None and not fileSaved:
-                preview = composeQrOverCamera(display, statusCard, canvasSize=screenSize())
+                preview = composeQrOverCamera(frame, statusCard, canvasSize=screenSize())
             elif fileSaved and doneCard is not None:
-                preview = composeQrOverCamera(display, doneCard, canvasSize=screenSize())
+                preview = composeQrOverCamera(frame, doneCard, canvasSize=screenSize())
+            else:
+                preview = composeReceiverMonitor(
+                    frame,
+                    points,
+                    headerGot=headerMeta is not None,
+                    chunkMap=chunkMap,
+                    totalFrames=knownTotal,
+                    lastSeenSeq=lastSeenSeq,
+                )
             showOnSender(windowName, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -427,6 +499,8 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 if entryKind == "calibrate":
                     scanRoi.lock()
                     print("Calibration locked. Real files start next.")
+                elif entryKind == "pack":
+                    filesSaved += int(headerMeta.get("packFiles") or 1)
                 else:
                     filesSaved += 1
                 relPath = str(headerMeta.get("relPath") or "")

@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_RECEIVE_DIR = PROJECT_ROOT / "received"
 DEFAULT_SHARE_DIR = Path("/Users/antonio/Desktop/jellyfin")
 DEFAULT_CAMERA_INDEX = 0
-DEFAULT_FRAME_DELAY = 0.5
+DEFAULT_FRAME_DELAY = 0.32
 
 
 def promptChoice(promptText: str, allowed: set[str]) -> str:
