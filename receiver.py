@@ -18,7 +18,6 @@ from sender import (
     buildQrImage,
     composeQrOverCamera,
     drawQrOutline,
-    drawRoiBox,
     openCamera,
     runReceiverAlignment,
     screenSize,
@@ -163,6 +162,10 @@ def trySaveFile(headerMeta, chunkMap, outputPath: Path) -> bool:
     if fileIndex and fileCount:
         progress = f" [{fileIndex}/{fileCount}]"
 
+    if entryKind == "calibrate":
+        print("Calibration frames received. Not writing a file.")
+        return True
+
     if entryKind == "dir":
         dest = writeReceivedDir(str(outputPath), rootName, relPath)
         print(f"Saved empty dir{progress}: {dest}")
@@ -279,19 +282,19 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
         capture.release()
         cv2.destroyAllWindows()
         return
-    if scanRoi.box:
-        print(f"QR search box locked after handshake: {scanRoi.box}")
+    print("Waiting for 10-frame calibration QR set to lock a FIXED search crop.")
+    scanRoi.beginCalibrate()
 
     try:
         while True:
-            frame = stream.read()
+            frame = stream.read(scanRoi.captureBox())
             if frame is None:
                 key = cv2.waitKey(10) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 continue
 
-            rawText, points = scanRoi.detect(detector, frame)
+            rawText, points = scanRoi.process(detector, frame)
             pendingStatusRound = None
 
             if rawText:
@@ -376,7 +379,6 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 lastReplyAt = time.time()
 
             display = frame.copy()
-            drawRoiBox(display, scanRoi.box)
             drawQrOutline(display, points)
             preview = scaleFrameToFit(display)
             preview = drawChunkOverlay(
@@ -397,7 +399,12 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
 
             if not fileSaved and trySaveFile(headerMeta, chunkMap, outputPath):
                 fileSaved = True
-                filesSaved += 1
+                entryKind = str(headerMeta.get("entryKind") or "file")
+                if entryKind == "calibrate":
+                    scanRoi.lock()
+                    print("Calibration locked. Real files start next.")
+                else:
+                    filesSaved += 1
                 relPath = str(headerMeta.get("relPath") or "")
                 fileIndex = headerMeta.get("fileIndex")
                 if fileIndex is not None:

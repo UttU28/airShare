@@ -15,6 +15,7 @@ from qrcode.constants import ERROR_CORRECT_M
 
 from packer import humanSize, listShareEntries
 from protocol import (
+    DEFAULT_CHUNK_SIZE,
     decodeFrame,
     encodeAckRequest,
     encodeAlign,
@@ -246,6 +247,47 @@ def buildEntryFrames(
     return frames, summary
 
 
+CALIBRATE_FRAME_COUNT = 10
+
+
+def buildCalibrateFrames(sessionId: str, realFileCount: int) -> tuple[List[str], dict]:
+    """Tiny dummy file: 1 header + 9 data QRs so both cameras can lock a fixed crop."""
+    transferId = makeTransferId()
+    dataFrameCount = max(1, CALIBRATE_FRAME_COUNT - 1)
+    payloadBytes = (b"CALIBRATE-QR-LOCK-" * (dataFrameCount * DEFAULT_CHUNK_SIZE))[
+        : dataFrameCount * DEFAULT_CHUNK_SIZE
+    ]
+    headerMeta, dataChunks = packBytePayload(
+        payloadBytes,
+        transferId,
+        extraMeta={
+            "sessionId": sessionId,
+            "rootName": "calibrate",
+            "relPath": "_calibrate.dat",
+            "entryKind": "calibrate",
+            "fileIndex": 0,
+            "fileCount": realFileCount,
+        },
+    )
+    frames: List[str] = [encodeHeaderFrame(headerMeta)]
+    total = int(headerMeta["total"])
+    for index, chunkBytes in enumerate(dataChunks, start=1):
+        frames.append(encodeDataFrame(transferId, index, total, chunkBytes))
+    summary = {
+        "sessionId": sessionId,
+        "transferId": transferId,
+        "rootName": "calibrate",
+        "relPath": "_calibrate.dat",
+        "entryKind": "calibrate",
+        "fileIndex": 0,
+        "fileCount": realFileCount,
+        "byteSize": len(payloadBytes),
+        "totalFrames": total,
+        "humanSize": humanSize(len(payloadBytes)),
+    }
+    return frames, summary
+
+
 def sendUntilComplete(
     windowName: str,
     frames: List[str],
@@ -365,77 +407,68 @@ def safeDetectAndDecode(detector, frame):
 
 
 class QrScanRoi:
-    """After handshake, decode only a padded box around the last known QR."""
+    """Full-frame until a calibration pass, then a fixed crop forever."""
 
-    def __init__(self, padRatio: float = 0.45, missLimit: int = 6) -> None:
+    def __init__(self, padRatio: float = 0.28) -> None:
         self.box = None
-        self.misses = 0
+        self.locked = False
+        self.calibrating = False
+        self.samples: List[tuple[int, int, int, int]] = []
         self.padRatio = padRatio
-        self.missLimit = missLimit
-        self.fullFrameFallbacks = 0
 
-    def detect(self, detector, frame):
-        crop, origin = self._crop(frame)
-        rawText, points = safeDetectAndDecode(detector, crop)
-        if rawText and points is not None:
-            points = self._offsetPoints(points, origin)
-            self._updateFromPoints(frame, points)
-            self.misses = 0
-            return rawText, points
+    def beginCalibrate(self) -> None:
+        self.locked = False
+        self.calibrating = True
+        self.samples = []
+        self.box = None
+        print("QR calibration: collecting positions (box stays unset until lock).")
 
-        self.misses += 1
-        if self.box is not None and self.misses >= self.missLimit:
-            self.fullFrameFallbacks += 1
-            rawText, points = safeDetectAndDecode(detector, frame)
-            if rawText and points is not None:
-                self._updateFromPoints(frame, points)
-                self.misses = 0
-                return rawText, points
-            self.box = None
-            self.misses = 0
-        return rawText or "", points
+    def captureBox(self):
+        if self.locked and self.box is not None:
+            return self.box
+        return None
 
-    def _crop(self, frame):
-        if self.box is None:
-            return frame, (0, 0)
-        height, width = frame.shape[:2]
-        x0, y0, x1, y1 = self.box
-        x0 = max(0, min(width - 1, x0))
-        y0 = max(0, min(height - 1, y0))
-        x1 = max(x0 + 1, min(width, x1))
-        y1 = max(y0 + 1, min(height, y1))
-        if (x1 - x0) < 48 or (y1 - y0) < 48:
-            return frame, (0, 0)
-        return frame[y0:y1, x0:x1], (x0, y0)
+    def lock(self) -> bool:
+        if not self.samples:
+            print("QR calibration: no samples, staying on full frame.")
+            self.calibrating = False
+            return False
+        minX = min(s[0] for s in self.samples)
+        minY = min(s[1] for s in self.samples)
+        maxX = max(s[2] for s in self.samples)
+        maxY = max(s[3] for s in self.samples)
+        width = max(1, maxX - minX)
+        height = max(1, maxY - minY)
+        padX = int(width * self.padRatio)
+        padY = int(height * self.padRatio)
+        self.box = (
+            max(0, minX - padX),
+            max(0, minY - padY),
+            maxX + padX,
+            maxY + padY,
+        )
+        self.locked = True
+        self.calibrating = False
+        print(
+            f"QR search box LOCKED (fixed): {self.box}  "
+            f"from {len(self.samples)} samples. Decode/render use this crop only."
+        )
+        return True
 
-    def _offsetPoints(self, points, origin):
-        ox, oy = origin
-        pts = np.array(points, dtype=np.float32)
-        pts[..., 0] += ox
-        pts[..., 1] += oy
-        return pts
+    def process(self, detector, frame):
+        """Decode. When locked, `frame` is already the crop. Points are in view coords."""
+        rawText, points = safeDetectAndDecode(detector, frame)
+        if self.calibrating and (not self.locked) and rawText and points is not None:
+            self._addSample(frame, points)
+        return rawText, points
 
-    def _updateFromPoints(self, frame, points) -> None:
+    def _addSample(self, frame, points) -> None:
         pts = np.array(points, dtype=np.float32).reshape(-1, 2)
         if pts.shape[0] < 4:
             return
-        height, width = frame.shape[:2]
         minX, minY = pts.min(axis=0)
         maxX, maxY = pts.max(axis=0)
-        boxW = max(1.0, maxX - minX)
-        boxH = max(1.0, maxY - minY)
-        padX = boxW * self.padRatio
-        padY = boxH * self.padRatio
-        x0 = int(minX - padX)
-        y0 = int(minY - padY)
-        x1 = int(maxX + padX)
-        y1 = int(maxY + padY)
-        self.box = (
-            max(0, x0),
-            max(0, y0),
-            min(width, x1),
-            min(height, y1),
-        )
+        self.samples.append((int(minX), int(minY), int(maxX), int(maxY)))
 
 
 def drawQrOutline(display, points) -> None:
@@ -455,23 +488,6 @@ def drawQrOutline(display, points) -> None:
         cv2.polylines(display, [pts.reshape((-1, 2))], True, (0, 255, 0), 2)
     except cv2.error:
         return
-
-
-def drawRoiBox(display, box) -> None:
-    if not box:
-        return
-    x0, y0, x1, y1 = box
-    cv2.rectangle(display, (x0, y0), (x1, y1), (0, 200, 255), 2)
-    cv2.putText(
-        display,
-        "QR search",
-        (x0 + 6, max(18, y0 - 8)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 200, 255),
-        1,
-        cv2.LINE_AA,
-    )
 
 
 def openCamera(cameraIndex: int):
@@ -516,11 +532,19 @@ class CameraStream:
             else:
                 time.sleep(0.005)
 
-    def read(self):
+    def read(self, box=None):
         with self.lock:
             if self.frame is None:
                 return None
-            return self.frame.copy()
+            if box is None:
+                return self.frame.copy()
+            height, width = self.frame.shape[:2]
+            x0, y0, x1, y1 = box
+            x0 = max(0, min(width - 1, int(x0)))
+            y0 = max(0, min(height - 1, int(y0)))
+            x1 = max(x0 + 1, min(width, int(x1)))
+            y1 = max(y0 + 1, min(height, int(y1)))
+            return np.ascontiguousarray(self.frame[y0:y1, x0:x1])
 
     def stop(self) -> None:
         self.running = False
@@ -605,14 +629,14 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
     holdUntil = 0.0
     try:
         while True:
-            frame = stream.read()
+            frame = stream.read(scanRoi.captureBox())
             if frame is None:
                 key = cv2.waitKey(10) & 0xFF
                 if key in (ord("q"), 27):
                     return "quit"
                 continue
 
-            rawText, points = scanRoi.detect(detector, frame)
+            rawText, points = scanRoi.process(detector, frame)
             if phase == "scan1":
                 step = None
                 hid = None
@@ -680,11 +704,9 @@ def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | N
                     )
             else:
                 annotated = frame.copy()
-                drawRoiBox(annotated, scanRoi.box)
                 drawQrOutline(annotated, points)
                 display = composeQrOverCamera(annotated, alignCard, canvasSize=screenSize())
             if phase == "scan1" or alignCard is None:
-                drawRoiBox(display, scanRoi.box)
                 drawQrOutline(display, points)
             showOnSender(windowName, display)
             key = cv2.waitKey(1) & 0xFF
@@ -709,14 +731,14 @@ def runReceiverAlignment(
     card = makeAlignCard(1, handshakeId, "Receiver QR 1 — sender should scan this")
     phase = 1
     while True:
-        frame = stream.read()
+        frame = stream.read(scanRoi.captureBox())
         if frame is None:
             key = cv2.waitKey(10) & 0xFF
             if key in (ord("q"), 27):
                 return "quit"
             continue
 
-        rawText, points = scanRoi.detect(detector, frame)
+        rawText, points = scanRoi.process(detector, frame)
         if rawText:
             payload = decodeFrame(rawText)
             if payload and payload.get("kind") == "align":
@@ -731,7 +753,6 @@ def runReceiverAlignment(
                     return handshakeId
 
         annotated = frame.copy()
-        drawRoiBox(annotated, scanRoi.box)
         drawQrOutline(annotated, points)
         if card is not None:
             display = composeQrOverCamera(annotated, card, canvasSize=screenSize())
@@ -786,16 +807,15 @@ def freezeOnLastUntilStatus(
     startedAt = time.time()
     try:
         while True:
-            frame = stream.read()
+            frame = stream.read(scanRoi.captureBox())
             if frame is None:
                 key = cv2.waitKey(10) & 0xFF
                 if key in (ord("q"), 27):
                     return "quit"
                 continue
 
-            rawText, points = scanRoi.detect(detector, frame)
+            rawText, points = scanRoi.process(detector, frame)
             annotated = frame.copy()
-            drawRoiBox(annotated, scanRoi.box)
             drawQrOutline(annotated, points)
             display = composeQrOverCamera(annotated, lastCard, canvasSize=screenSize())
             elapsed = time.time() - startedAt
@@ -865,8 +885,17 @@ def runSender(
             print("Sender stopped.")
             return
 
-        if scanRoi.box:
-            print(f"QR search box locked after handshake: {scanRoi.box}")
+        print("\nCalibration file: 10 QR frames to lock a FIXED search crop.")
+        scanRoi.beginCalibrate()
+        calFrames, calSummary = buildCalibrateFrames(sessionId, fileCount)
+        calResult = sendUntilComplete(
+            windowName, calFrames, calSummary, frameDelay, cameraIndex, scanRoi=scanRoi
+        )
+        if calResult == "quit":
+            print("Sender stopped.")
+            return
+        scanRoi.lock()
+
         print(f"\nFrame interval: {frameDelay:.2f}s")
         print("Press [q] to quit.\n")
 
