@@ -308,13 +308,13 @@ def sendUntilComplete(
             cv2.waitKey(1)
 
             while True:
-            statusPayload = freezeOnLastUntilStatus(
-                windowName,
-                lastCard,
-                transferId,
-                cameraIndex,
-                scanRoi=scanRoi,
-            )
+                statusPayload = freezeOnLastUntilStatus(
+                    windowName,
+                    lastCard,
+                    transferId,
+                    cameraIndex,
+                    scanRoi=scanRoi,
+                )
                 if statusPayload == "quit":
                     return "quit"
                 if statusPayload is None:
