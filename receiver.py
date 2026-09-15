@@ -13,13 +13,14 @@ from packer import humanSize, writeReceivedDir, writeReceivedFile
 from protocol import decodeFrame, encodeDone, encodeStatus, rebuildArchive, validateDataFrame
 from sender import (
     CameraStream,
+    QrScanRoi,
     buildPolaroidCard,
     buildQrImage,
     composeQrOverCamera,
     drawQrOutline,
+    drawRoiBox,
     openCamera,
     runReceiverAlignment,
-    safeDetectAndDecode,
     screenSize,
     setupFullscreen,
     showOnSender,
@@ -247,6 +248,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
 
     detector = cv2.QRCodeDetector()
     stream = CameraStream(capture)
+    scanRoi = QrScanRoi()
     headerMeta: Optional[dict] = None
     transferId: Optional[str] = None
     chunkMap: Dict[int, bytes] = {}
@@ -271,12 +273,14 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
     print("Files are saved one at a time as each completes.")
     print("Press [q] to quit.\n")
 
-    aligned = runReceiverAlignment(windowName, stream, detector)
+    aligned = runReceiverAlignment(windowName, stream, detector, scanRoi=scanRoi)
     if aligned == "quit":
         stream.stop()
         capture.release()
         cv2.destroyAllWindows()
         return
+    if scanRoi.box:
+        print(f"QR search box locked after handshake: {scanRoi.box}")
 
     try:
         while True:
@@ -287,7 +291,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                     break
                 continue
 
-            rawText, points = safeDetectAndDecode(detector, frame)
+            rawText, points = scanRoi.detect(detector, frame)
             pendingStatusRound = None
 
             if rawText:
@@ -372,6 +376,7 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 lastReplyAt = time.time()
 
             display = frame.copy()
+            drawRoiBox(display, scanRoi.box)
             drawQrOutline(display, points)
             preview = scaleFrameToFit(display)
             preview = drawChunkOverlay(
@@ -382,9 +387,9 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 lastSeenSeq=lastSeenSeq,
             )
             if statusCard is not None and not fileSaved:
-                preview = composeQrOverCamera(frame, statusCard, canvasSize=screenSize())
+                preview = composeQrOverCamera(display, statusCard, canvasSize=screenSize())
             elif fileSaved and doneCard is not None:
-                preview = composeQrOverCamera(frame, doneCard, canvasSize=screenSize())
+                preview = composeQrOverCamera(display, doneCard, canvasSize=screenSize())
             showOnSender(windowName, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):

@@ -252,8 +252,11 @@ def sendUntilComplete(
     summary: dict,
     frameDelay: float,
     cameraIndex: int,
+    scanRoi: QrScanRoi | None = None,
 ) -> str:
     """Play one file's frames until receiver done or quit. Returns complete|quit."""
+    if scanRoi is None:
+        scanRoi = QrScanRoi()
     qrPrefetch = QrPrefetcher(frames, ahead=24)
     transferId = summary["transferId"]
     totalFrames = len(frames)
@@ -305,12 +308,13 @@ def sendUntilComplete(
             cv2.waitKey(1)
 
             while True:
-                statusPayload = freezeOnLastUntilStatus(
-                    windowName,
-                    lastCard,
-                    transferId,
-                    cameraIndex,
-                )
+            statusPayload = freezeOnLastUntilStatus(
+                windowName,
+                lastCard,
+                transferId,
+                cameraIndex,
+                scanRoi=scanRoi,
+            )
                 if statusPayload == "quit":
                     return "quit"
                 if statusPayload is None:
@@ -360,6 +364,80 @@ def safeDetectAndDecode(detector, frame):
     return rawText, points
 
 
+class QrScanRoi:
+    """After handshake, decode only a padded box around the last known QR."""
+
+    def __init__(self, padRatio: float = 0.45, missLimit: int = 6) -> None:
+        self.box = None
+        self.misses = 0
+        self.padRatio = padRatio
+        self.missLimit = missLimit
+        self.fullFrameFallbacks = 0
+
+    def detect(self, detector, frame):
+        crop, origin = self._crop(frame)
+        rawText, points = safeDetectAndDecode(detector, crop)
+        if rawText and points is not None:
+            points = self._offsetPoints(points, origin)
+            self._updateFromPoints(frame, points)
+            self.misses = 0
+            return rawText, points
+
+        self.misses += 1
+        if self.box is not None and self.misses >= self.missLimit:
+            self.fullFrameFallbacks += 1
+            rawText, points = safeDetectAndDecode(detector, frame)
+            if rawText and points is not None:
+                self._updateFromPoints(frame, points)
+                self.misses = 0
+                return rawText, points
+            self.box = None
+            self.misses = 0
+        return rawText or "", points
+
+    def _crop(self, frame):
+        if self.box is None:
+            return frame, (0, 0)
+        height, width = frame.shape[:2]
+        x0, y0, x1, y1 = self.box
+        x0 = max(0, min(width - 1, x0))
+        y0 = max(0, min(height - 1, y0))
+        x1 = max(x0 + 1, min(width, x1))
+        y1 = max(y0 + 1, min(height, y1))
+        if (x1 - x0) < 48 or (y1 - y0) < 48:
+            return frame, (0, 0)
+        return frame[y0:y1, x0:x1], (x0, y0)
+
+    def _offsetPoints(self, points, origin):
+        ox, oy = origin
+        pts = np.array(points, dtype=np.float32)
+        pts[..., 0] += ox
+        pts[..., 1] += oy
+        return pts
+
+    def _updateFromPoints(self, frame, points) -> None:
+        pts = np.array(points, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] < 4:
+            return
+        height, width = frame.shape[:2]
+        minX, minY = pts.min(axis=0)
+        maxX, maxY = pts.max(axis=0)
+        boxW = max(1.0, maxX - minX)
+        boxH = max(1.0, maxY - minY)
+        padX = boxW * self.padRatio
+        padY = boxH * self.padRatio
+        x0 = int(minX - padX)
+        y0 = int(minY - padY)
+        x1 = int(maxX + padX)
+        y1 = int(maxY + padY)
+        self.box = (
+            max(0, x0),
+            max(0, y0),
+            min(width, x1),
+            min(height, y1),
+        )
+
+
 def drawQrOutline(display, points) -> None:
     if points is None:
         return
@@ -377,6 +455,23 @@ def drawQrOutline(display, points) -> None:
         cv2.polylines(display, [pts.reshape((-1, 2))], True, (0, 255, 0), 2)
     except cv2.error:
         return
+
+
+def drawRoiBox(display, box) -> None:
+    if not box:
+        return
+    x0, y0, x1, y1 = box
+    cv2.rectangle(display, (x0, y0), (x1, y1), (0, 200, 255), 2)
+    cv2.putText(
+        display,
+        "QR search",
+        (x0 + 6, max(18, y0 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 200, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def openCamera(cameraIndex: int):
@@ -490,9 +585,11 @@ def makeAlignCard(step: int, handshakeId: str, caption: str) -> np.ndarray:
     )
 
 
-def runSenderAlignment(windowName: str, cameraIndex: int):
+def runSenderAlignment(windowName: str, cameraIndex: int, scanRoi: QrScanRoi | None = None):
     """QR1 from receiver, then QR2 and last QR3 from sender. Receiver stays aimed at sender."""
     print("Alignment: camera only until QR 1. Then sender shows QR 2, then last QR 3.")
+    if scanRoi is None:
+        scanRoi = QrScanRoi()
     capture = openCamera(cameraIndex)
     if capture is None:
         raise RuntimeError("Could not open sender camera for alignment.")
@@ -515,7 +612,7 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
                     return "quit"
                 continue
 
-            rawText, points = safeDetectAndDecode(detector, frame)
+            rawText, points = scanRoi.detect(detector, frame)
             if phase == "scan1":
                 step = None
                 hid = None
@@ -582,8 +679,13 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
                         cv2.LINE_AA,
                     )
             else:
-                display = composeQrOverCamera(frame, alignCard, canvasSize=screenSize())
-            drawQrOutline(display, points)
+                annotated = frame.copy()
+                drawRoiBox(annotated, scanRoi.box)
+                drawQrOutline(annotated, points)
+                display = composeQrOverCamera(annotated, alignCard, canvasSize=screenSize())
+            if phase == "scan1" or alignCard is None:
+                drawRoiBox(display, scanRoi.box)
+                drawQrOutline(display, points)
             showOnSender(windowName, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -593,8 +695,15 @@ def runSenderAlignment(windowName: str, cameraIndex: int):
         capture.release()
 
 
-def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
+def runReceiverAlignment(
+    windowName: str,
+    stream: CameraStream,
+    detector,
+    scanRoi: QrScanRoi | None = None,
+):
     """Show QR1 until sender QR2 is read, then camera-only until last sender QR3."""
+    if scanRoi is None:
+        scanRoi = QrScanRoi()
     handshakeId = makeTransferId()
     print(f"Alignment: showing QR 1 ({handshakeId}). Last QR will come from the sender.")
     card = makeAlignCard(1, handshakeId, "Receiver QR 1 — sender should scan this")
@@ -607,7 +716,7 @@ def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
                 return "quit"
             continue
 
-        rawText, points = safeDetectAndDecode(detector, frame)
+        rawText, points = scanRoi.detect(detector, frame)
         if rawText:
             payload = decodeFrame(rawText)
             if payload and payload.get("kind") == "align":
@@ -621,10 +730,13 @@ def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
                     print("Got last sender QR 3. Alignment complete. Ready for data.")
                     return handshakeId
 
+        annotated = frame.copy()
+        drawRoiBox(annotated, scanRoi.box)
+        drawQrOutline(annotated, points)
         if card is not None:
-            display = composeQrOverCamera(frame, card, canvasSize=screenSize())
+            display = composeQrOverCamera(annotated, card, canvasSize=screenSize())
         else:
-            display = cv2.resize(frame, screenSize(), interpolation=cv2.INTER_AREA)
+            display = cv2.resize(annotated, screenSize(), interpolation=cv2.INTER_AREA)
             cv2.putText(
                 display,
                 "Look at SENDER  —  waiting for last handshake QR 3",
@@ -635,7 +747,6 @@ def runReceiverAlignment(windowName: str, stream: CameraStream, detector):
                 2,
                 cv2.LINE_AA,
             )
-        drawQrOutline(display, points)
         showOnSender(windowName, display)
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):
@@ -658,9 +769,12 @@ def freezeOnLastUntilStatus(
     lastCard: np.ndarray,
     transferId: str,
     cameraIndex: int,
+    scanRoi: QrScanRoi | None = None,
 ):
     """Show last QR and scan for status at the same time. Camera thread never sleeps."""
     print("Frozen on last frame. Camera stays live under the QR overlay until status is read.")
+    if scanRoi is None:
+        scanRoi = QrScanRoi()
     capture = openCamera(cameraIndex)
     if capture is None:
         print(f"Could not open camera {cameraIndex} for status scan.")
@@ -679,9 +793,11 @@ def freezeOnLastUntilStatus(
                     return "quit"
                 continue
 
-            rawText, points = safeDetectAndDecode(detector, frame)
-            display = composeQrOverCamera(frame, lastCard, canvasSize=screenSize())
-            drawQrOutline(display, points)
+            rawText, points = scanRoi.detect(detector, frame)
+            annotated = frame.copy()
+            drawRoiBox(annotated, scanRoi.box)
+            drawQrOutline(annotated, points)
+            display = composeQrOverCamera(annotated, lastCard, canvasSize=screenSize())
             elapsed = time.time() - startedAt
             cv2.putText(
                 display,
@@ -741,13 +857,16 @@ def runSender(
     print("Each file is ACK'd and saved before the next one starts.")
 
     windowName = "codeShare Sender"
+    scanRoi = QrScanRoi()
     try:
         setupFullscreen(windowName)
-        aligned = runSenderAlignment(windowName, cameraIndex)
+        aligned = runSenderAlignment(windowName, cameraIndex, scanRoi=scanRoi)
         if aligned == "quit":
             print("Sender stopped.")
             return
 
+        if scanRoi.box:
+            print(f"QR search box locked after handshake: {scanRoi.box}")
         print(f"\nFrame interval: {frameDelay:.2f}s")
         print("Press [q] to quit.\n")
 
@@ -760,7 +879,7 @@ def runSender(
                 entry, sessionId, rootName, fileIndex, fileCount
             )
             result = sendUntilComplete(
-                windowName, frames, summary, frameDelay, cameraIndex
+                windowName, frames, summary, frameDelay, cameraIndex, scanRoi=scanRoi
             )
             if result == "quit":
                 print("Sender stopped.")
