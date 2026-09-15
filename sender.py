@@ -284,7 +284,10 @@ def sendUntilComplete(
                 )
                 qrPrefetch.drop(seq)
                 showOnSender(windowName, card)
-                if waitForFrame(frameDelay) == "quit":
+                hold = frameDelay
+                if seq == 0:
+                    hold = max(frameDelay, 1.5)
+                if waitForFrame(hold) == "quit":
                     return "quit"
 
             ackText = encodeAckRequest(transferId, totalFrames, roundIndex)
@@ -301,34 +304,45 @@ def sendUntilComplete(
             showOnSender(windowName, lastCard)
             cv2.waitKey(1)
 
-            statusPayload = freezeOnLastUntilStatus(
-                windowName,
-                lastCard,
-                transferId,
-                cameraIndex,
-            )
-            if statusPayload == "quit":
-                return "quit"
-            if statusPayload is None:
-                print("No status received. Repeating ACK.")
-                continue
-
-            if statusPayload.get("kind") == "done":
-                pending = []
-            else:
-                pending = missingSeqsFromStatus(statusPayload)
-            print(f"Receiver still missing {len(pending)} frame(s) for this file.")
-            if previousMissing is not None and pending == previousMissing:
-                frameDelay += 0.5
-                print(
-                    f"Missing set unchanged. Interval +0.5s → {frameDelay:.2f}s "
-                    "(kept for later rounds of this file)."
+            while True:
+                statusPayload = freezeOnLastUntilStatus(
+                    windowName,
+                    lastCard,
+                    transferId,
+                    cameraIndex,
                 )
-            previousMissing = list(pending)
-            if not pending:
-                print(f"File complete: {summary['relPath']}")
-                return "complete"
-            roundIndex += 1
+                if statusPayload == "quit":
+                    return "quit"
+                if statusPayload is None:
+                    print("No status received. Repeating ACK.")
+                    roundIndex += 1
+                    break
+
+                if statusPayload.get("kind") == "done":
+                    doneIndex = statusPayload.get("fileIndex")
+                    if doneIndex is not None and int(doneIndex) != int(summary["fileIndex"]):
+                        print(
+                            f"Ignoring DONE for file {doneIndex}, "
+                            f"still on {summary['fileIndex']}."
+                        )
+                        continue
+                    print(f"File complete: {summary['relPath']}")
+                    return "complete"
+
+                pending = missingSeqsFromStatus(statusPayload)
+                print(f"Receiver still missing {len(pending)} frame(s) for this file.")
+                if not pending:
+                    print("Receiver has all chunks. Waiting for FILE COMPLETE QR...")
+                    continue
+                if previousMissing is not None and pending == previousMissing:
+                    frameDelay += 0.5
+                    print(
+                        f"Missing set unchanged. Interval +0.5s → {frameDelay:.2f}s "
+                        "(kept for later rounds of this file)."
+                    )
+                previousMissing = list(pending)
+                roundIndex += 1
+                break
         return "complete"
     finally:
         qrPrefetch.close()
@@ -694,7 +708,7 @@ def freezeOnLastUntilStatus(
             if str(payload.get("transferId")) != transferId:
                 continue
             if payload.get("kind") == "done":
-                print("Receiver reports this file is complete.")
+                print("Receiver FILE COMPLETE QR matched this transferId.")
             else:
                 print(
                     f"Got status: {payload.get('gotCount')}/{payload.get('total')} chunks on receiver"

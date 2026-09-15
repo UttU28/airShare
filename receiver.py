@@ -174,8 +174,13 @@ def trySaveFile(headerMeta, chunkMap, outputPath: Path) -> bool:
     return True
 
 
-def buildDoneCard(transferId: str, knownTotal: int, relPath: str = "") -> np.ndarray:
-    doneText = encodeDone(transferId, knownTotal)
+def buildDoneCard(
+    transferId: str,
+    knownTotal: int,
+    relPath: str = "",
+    fileIndex: int | None = None,
+) -> np.ndarray:
+    doneText = encodeDone(transferId, knownTotal, fileIndex=fileIndex)
     return buildPolaroidCard(
         buildQrImage(doneText),
         captionLines=[
@@ -299,10 +304,17 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
 
                     total = int(payload["total"])
                     frameTransferId = str(payload["transferId"])
+                    sameFile = transferId is not None and frameTransferId == transferId
+                    nextFileReady = fileSaved and not sameFile
 
-                    if kind == "header" and (
-                        transferId is None or (fileSaved and frameTransferId != transferId)
-                    ):
+                    if transferId is None or nextFileReady:
+                        if nextFileReady:
+                            print(
+                                f"\nPrevious file saved. Switching to {frameTransferId} "
+                                f"({kind})"
+                            )
+                        else:
+                            print(f"\nStarting file transfer {frameTransferId}")
                         transferId = frameTransferId
                         headerMeta = None
                         chunkMap = {}
@@ -312,15 +324,14 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                         statusCard = None
                         doneCard = None
                         fileSaved = False
-                        print(f"\nStarting file transfer {frameTransferId}")
 
                     knownTotal = total
 
-                    if transferId is None:
-                        transferId = frameTransferId
-
                     if frameTransferId != transferId:
-                        print(f"Ignoring other file transferId: {frameTransferId}")
+                        print(
+                            f"Still receiving current file; ignoring {kind} "
+                            f"from {frameTransferId}"
+                        )
                     elif kind == "ackRequest":
                         roundIndex = int(payload.get("round", 0))
                         canRetry = (time.time() - lastReplyAt) > ACK_RETRY_SECONDS
@@ -383,7 +394,15 @@ def runReceiver(outputDir: str, cameraIndex: int = 0) -> None:
                 fileSaved = True
                 filesSaved += 1
                 relPath = str(headerMeta.get("relPath") or "")
-                doneCard = buildDoneCard(str(transferId), int(headerMeta["total"]), relPath)
+                fileIndex = headerMeta.get("fileIndex")
+                if fileIndex is not None:
+                    fileIndex = int(fileIndex)
+                doneCard = buildDoneCard(
+                    str(transferId),
+                    int(headerMeta["total"]),
+                    relPath,
+                    fileIndex=fileIndex,
+                )
                 statusCard = None
                 print("Showing FILE COMPLETE QR. Waiting for next file or session done.")
     finally:

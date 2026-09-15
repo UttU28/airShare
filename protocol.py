@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 MAGIC = "CS01"
 # Small payloads keep QR version low so modules stay large on screen (easier under glare).
-DEFAULT_CHUNK_SIZE = 200
+DEFAULT_CHUNK_SIZE = 400
 HEADER_SEQ = 0
 
 
@@ -139,7 +139,7 @@ def encodeSessionDone(sessionId: str, fileCount: int) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
-def encodeDone(transferId: str, total: int) -> str:
+def encodeDone(transferId: str, total: int, fileIndex: int | None = None) -> str:
     payload = {
         "magic": MAGIC,
         "kind": "done",
@@ -147,6 +147,8 @@ def encodeDone(transferId: str, total: int) -> str:
         "total": total,
         "gotCount": total,
     }
+    if fileIndex is not None:
+        payload["fileIndex"] = int(fileIndex)
     return json.dumps(payload, separators=(",", ":"))
 
 
